@@ -583,8 +583,11 @@ if DB_MODE:
     from views import data_tools
     data_tools.legacy_panel(store, PROGRESS_PATH, _ls_raw, {w["no"] for w in words})
 
+TAB_LABELS = ["🏠 오늘", "📖 학습", "✍️ 쓰기 연습", "📝 시험", "♾️ 무한", "📋 단어장", "✏️ 단어 관리", "📊 통계"]
+TAB_ALIASES = dict(zip(["today", "study", "write", "test", "inf", "words", "manage", "stats"], TAB_LABELS))
+# ?tab=write 처럼 시작 탭 지정 (갤럭시탭 홈 화면 바로가기를 S펜 쓰기 연습으로 만들 때)
 tab_today, tab_study, tab_write, tab_test, tab_inf, tab_wordbook, tab_mgmt, tab_stats = st.tabs(
-    ["🏠 오늘", "📖 학습", "✍️ 쓰기 연습", "📝 시험", "♾️ 무한", "📋 단어장", "✏️ 단어 관리", "📊 통계"]
+    TAB_LABELS, default=TAB_ALIASES.get(st.query_params.get("tab"))
 )
 
 
@@ -1451,6 +1454,9 @@ with tab_mgmt:
 # ============================================================
 with tab_stats:
     st.subheader("📊 학습 통계")
+    from views import dashboard
+    dashboard.render(store=store, words=words)
+    st.divider()
 
     if ai.enabled:
         with st.container(border=True):
