@@ -41,3 +41,41 @@ def app_test(data_copy):
         return at
 
     return make
+
+
+# ── Supabase 통합 테스트 (로컬 `supabase start` 또는 별도 테스트 프로젝트) ──
+# WORDLOOP_TEST_SUPABASE_URL / WORDLOOP_TEST_SUPABASE_ANON_KEY 가 없으면 건너뛴다.
+# 운영 프로젝트 키를 넣지 말 것: 테스트가 임의 계정을 만든다.
+def _supabase_env():
+    url = os.environ.get("WORDLOOP_TEST_SUPABASE_URL")
+    key = os.environ.get("WORDLOOP_TEST_SUPABASE_ANON_KEY")
+    if not (url and key):
+        pytest.skip("Supabase 테스트 DB 미설정")
+    return url, key
+
+
+def _client(url, key):
+    from supabase import ClientOptions, create_client
+    return create_client(url, key, options=ClientOptions(auto_refresh_token=False, persist_session=False))
+
+
+@pytest.fixture
+def supabase_user():
+    url, key = _supabase_env()
+    import uuid
+
+    from services.store import SupabaseStore
+
+    def make():
+        client = _client(url, key)
+        email = f"wl-test-{uuid.uuid4().hex[:10]}@example.com"
+        res = client.auth.sign_up({"email": email, "password": "test-password-123"})
+        assert res.session is not None, "로컬 Supabase는 이메일 확인 없이 가입되어야 함"
+        return client, SupabaseStore(client, res.user.id)
+
+    return make
+
+
+@pytest.fixture
+def anon_client():
+    return _client(*_supabase_env())

@@ -6,6 +6,7 @@ import os
 import json
 import random
 import time
+import uuid
 from datetime import datetime
 
 import base64
@@ -16,6 +17,10 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval
+
+from services import migrate
+from services.config import utcnow
+from views import account
 
 # ============================================================
 # 페이지 설정 (반드시 첫 번째 Streamlit 호출)
@@ -134,6 +139,10 @@ PROGRESS_PATH = os.environ.get("WORDLOOP_PROGRESS_PATH", os.path.join(BASE_DIR, 
 SHEET_NAME = "영어 단어장"
 GEMINI_MODEL = "gemini-3.6-flash"
 
+# 저장소: Supabase 설정 시 로그인(미로그인이면 로그인 화면에서 멈춤), 아니면 로컬 SQLite
+store = account.init()
+DB_MODE = store.kind == "supabase"
+
 # ============================================================
 # 데이터 로드 / 저장
 # ============================================================
@@ -159,30 +168,43 @@ def load_words(mtime: float = 0):
     G열('오답 체크')·H열('중복 체크')은 수식이므로 캐시된 계산값을 들고
     다니지 않는다 — 저장 시 행 번호 기준으로 다시 생성한다.
     """
-    wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
-    ws = wb[SHEET_NAME]
-    result = []
-    auto_no = 1  # 번호 열이 비어 있을 때 자동 부여용
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
-        if not row[1]:
-            continue
-        # 번호(col 1)가 없으면 자동 부여
-        no_val = row[0] if row[0] else auto_no
-        result.append({
-            "no":       no_val,
-            "word":     str(row[1]).strip(),
-            "meaning":  str(row[2]).strip() if row[2] else "",
-            "example":  str(row[3]).strip() if row[3] else "",
-            "category": str(row[8]).strip() if len(row) > 8 and row[8] else "기타",
-            "ai_example": str(row[9]).strip() if len(row) > 9 and row[9] else "",
-            "_extra":   list(row[4:6]),   # 열 5~6(암기 체크, 입력 날짜)만 보존
-        })
-        auto_no = int(no_val) + 1
+    result = migrate.read_excel_words(EXCEL_PATH)
+    for w in result:
+        # ponytail: 로컬 모드 word_id는 번호 기반. 마지막 번호를 지우고 다시 추가하면 이전 복습 기록이 이어짐.
+        w["id"] = migrate.word_uuid("local", w["no"])
     return result
 
 
+def load_words_db():
+    """로그인 사용자 소유 단어(번호가 겹치지 않도록 공용 단어는 기존 화면에서 제외)."""
+    if "wl_vocab" not in st.session_state:
+        rows = [r for r in store.list_vocabulary() if r.get("owner_user_id") == store.user_id]
+        st.session_state.wl_vocab = migrate.words_from_rows(rows)
+    return st.session_state.wl_vocab
+
+
+def save_words_to_db(word_list):
+    """변경된 단어만 upsert, 사라진 단어는 delete. 실패하면 저장됐다고 표시하지 않고 멈춘다."""
+    current = {w["no"]: w for w in st.session_state.wl_vocab}
+    fields = ("word", "meaning", "example", "category", "ai_example")
+    changed = [w for w in word_list
+               if w["no"] not in current or any(w.get(f, "") != current[w["no"]].get(f, "") for f in fields)]
+    removed = [current[no]["id"] for no in current.keys() - {w["no"] for w in word_list}]
+
+    def write():
+        store.upsert_vocabulary(migrate.vocabulary_rows(changed, store.user_id))
+        store.delete_vocabulary(removed)
+    account.save_with_status("단어장", write)
+    if st.session_state.wl_sync["state"] == "failed":
+        st.error("단어를 저장하지 못했습니다(동기화 실패). 네트워크를 확인한 뒤 다시 시도하세요.")
+        st.stop()
+    st.session_state.pop("wl_vocab", None)
+
+
 def save_words_to_excel(word_list):
-    """word_list를 Excel 파일에 저장하고 캐시를 초기화."""
+    """word_list를 Excel 파일에 저장하고 캐시를 초기화. (로그인 모드에서는 DB에 저장)"""
+    if DB_MODE:
+        return save_words_to_db(word_list)
     wb = openpyxl.load_workbook(EXCEL_PATH)
     ws = wb[SHEET_NAME]
 
@@ -230,6 +252,10 @@ def save_progress():
         "correct":   list(st.session_state.correct_words),
         "sessions":  st.session_state.sessions,
     }
+    if DB_MODE:
+        # 계정 DB가 정본. 공유 서버 파일·브라우저 저장소에 개인 기록을 남기지 않는다.
+        account.save_with_status("학습 진도", store.save_legacy_state, data)
+        return
     # 로컬 파일 저장 (PC 로컬 실행 시)
     try:
         with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
@@ -631,8 +657,16 @@ def pick_next_inf():
 # ============================================================
 # 세션 초기화
 # ============================================================
-_excel_mtime   = os.path.getmtime(EXCEL_PATH) if os.path.exists(EXCEL_PATH) else 0
-words          = load_words(_excel_mtime)
+if DB_MODE:
+    words = load_words_db()
+    if not words:
+        # 첫 로그인: 원본 단어장을 이 계정으로 가져와야 학습을 시작할 수 있다.
+        from views import data_tools
+        data_tools.first_run_import(store, EXCEL_PATH, PROGRESS_PATH)
+        st.stop()
+else:
+    _excel_mtime = os.path.getmtime(EXCEL_PATH) if os.path.exists(EXCEL_PATH) else 0
+    words        = load_words(_excel_mtime)
 all_categories = sorted(set(w["category"] for w in words))
 
 # localStorage 값 요청 (첫 렌더: None 반환 → 자동 rerun → 두 번째 렌더: 실제 값)
@@ -643,8 +677,8 @@ _ls_raw = streamlit_js_eval(
 )
 
 if "initialized" not in st.session_state:
-    # 일단 파일 기반으로 초기화 (로컬 실행 대응)
-    p = load_progress()
+    # 로그인 모드는 계정 DB, 로컬 모드는 파일 기반으로 초기화
+    p = (store.get_profile() or {}).get("legacy_state") or {} if DB_MODE else load_progress()
     st.session_state.memorized     = set(p.get("memorized", []))
     st.session_state.wrong         = set(p.get("wrong", []))
     st.session_state.correct_words = set(p.get("correct", []))
@@ -653,6 +687,9 @@ if "initialized" not in st.session_state:
     st.session_state._ls_applied   = False
 
 # localStorage 값이 도착하면 덮어쓰기 (클라우드 환경에서 진도 복원)
+# 로그인 모드는 자동 덮어쓰기 대신 '미리보기 → 병합' 화면에서 사용자가 고른다.
+if DB_MODE:
+    st.session_state._ls_applied = True
 if not st.session_state.get("_ls_applied") and _ls_raw is not None:
     if _ls_raw and _ls_raw not in ("null", "undefined", ""):
         try:
@@ -716,6 +753,11 @@ c3.metric("🎯 정답",   f"{cor_count}개")
 c4.metric("❌ 오답",   f"{len(st.session_state.wrong)}개")
 
 st.divider()
+
+account.sidebar(store, "")
+if DB_MODE:
+    from views import data_tools
+    data_tools.legacy_panel(store, PROGRESS_PATH, _ls_raw, {w["no"] for w in words})
 
 tab_study, tab_write, tab_test, tab_inf, tab_wordbook, tab_mgmt, tab_stats = st.tabs(
     ["📖 학습", "✍️ 쓰기 연습", "📝 시험", "♾️ 무한", "📋 단어장", "✏️ 단어 관리", "📊 통계"]
@@ -1131,6 +1173,9 @@ with tab_test:
                 "score": round(score, 1), "mode": mode, "direction": direction,
             }
             st.session_state.sessions.append(session)
+            account.save_with_status("시험 기록", store.add_test_session, {
+                "session_id": uuid.uuid4(), "mode": mode, "total": len(results),
+                "correct": correct_count, "finished_at": utcnow()}, queue=True)
             st.session_state.test_result = {
                 "results": results, "score": score, "correct_count": correct_count,
             }
@@ -1657,6 +1702,10 @@ with tab_mgmt:
                     if st.button("취소", use_container_width=True):
                         st.session_state.mgmt_confirm_delete = None
                         st.rerun()
+
+    st.divider()
+    from views import data_tools
+    data_tools.backup_panel(store, words, make_excel_bytes)
 
     if get_gemini_client() is not None:
         st.divider()

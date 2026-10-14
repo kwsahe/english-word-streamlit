@@ -86,3 +86,47 @@ def test_wordbook_and_stats_render(app_test):
     assert len(at.dataframe) >= 2  # 단어장 + 통계 표
     at.text_input(key="wb_search").input("a").run()
     assert not at.exception
+
+
+def test_db_mode_signup_import_and_cross_device(data_copy):
+    """로그인 모드: 가입 → Word.xlsx 가져오기 → 암기 체크 → 다른 기기(새 세션) 로그인 시 동일."""
+    import os
+    import uuid
+
+    import pytest
+    from streamlit.testing.v1 import AppTest
+
+    from conftest import ROOT
+    url, key = os.environ.get("WORDLOOP_TEST_SUPABASE_URL"), os.environ.get("WORDLOOP_TEST_SUPABASE_ANON_KEY")
+    if not (url and key):
+        pytest.skip("Supabase 테스트 DB 미설정")
+    email, pw = f"wl-app-{uuid.uuid4().hex[:8]}@example.com", "test-password-123"
+
+    def device():
+        at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=120)
+        at.secrets["SUPABASE_URL"], at.secrets["SUPABASE_ANON_KEY"] = url, key
+        at.run()
+        return at
+
+    pc = device()
+    assert "처음 사용 (가입)" in [t.label for t in pc.tabs]      # 로그인 전에는 학습 화면이 보이지 않음
+    assert "📖 학습" not in [t.label for t in pc.tabs]
+    pc.text_input(key="wl_signup_email").input(email)
+    pc.text_input(key="wl_signup_pw").input(pw)
+    pc.button(key="FormSubmitter:wl_signup-가입하기").click().run()
+    import_btn = next(b for b in pc.button if b.label.startswith("📥") and "단어 가져오기" in b.label)
+    import_btn.click().run()
+    assert not pc.exception
+    assert all(t in [x.label for x in pc.tabs] for t in LEGACY_TABS)
+    next(b for b in pc.button if b.label == "✅ 암기 완료").click().run()
+    memorized = set(pc.session_state.memorized)
+    assert len(memorized) == 1
+    # progress.json이 있으면 1회 가져오기 버튼이 보여야 한다
+    assert any(b.key == "wl_import_progress" for b in pc.button)
+
+    tablet = device()
+    tablet.text_input(key="wl_login_email").input(email)
+    tablet.text_input(key="wl_login_pw").input(pw)
+    tablet.button(key="FormSubmitter:wl_login-로그인").click().run()
+    assert not tablet.exception
+    assert set(tablet.session_state.memorized) == memorized
