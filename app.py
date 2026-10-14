@@ -127,8 +127,9 @@ st.markdown("""
 # 경로
 # ============================================================
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-EXCEL_PATH    = os.path.join(BASE_DIR, "Word.xlsx")
-PROGRESS_PATH = os.path.join(BASE_DIR, "progress.json")
+# 테스트는 환경변수로 임시 사본을 가리켜 원본 데이터를 건드리지 않는다.
+EXCEL_PATH    = os.environ.get("WORDLOOP_EXCEL_PATH", os.path.join(BASE_DIR, "Word.xlsx"))
+PROGRESS_PATH = os.environ.get("WORDLOOP_PROGRESS_PATH", os.path.join(BASE_DIR, "progress.json"))
 
 SHEET_NAME = "영어 단어장"
 GEMINI_MODEL = "gemini-3.6-flash"
