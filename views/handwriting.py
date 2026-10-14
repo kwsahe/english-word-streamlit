@@ -80,8 +80,10 @@ def render(*, store, ai, words, all_categories, filter_words, tts_button, on_leg
         except Exception:
             st.error("복습 일정을 불러오지 못했습니다(동기화 실패). '카테고리·범위'로 계속 연습할 수 있어요.")
             return
-        q = study.build_today_queue(words, progress, utcnow(), tz, new_limit=get_int_setting("hw_new_limit", 10),
-                                    review_limit=get_int_setting("hw_review_limit", 30), legacy_wrong=legacy_wrong)
+        from views.today import goals
+        g = goals(store)
+        q = study.build_today_queue(words, progress, utcnow(), tz, new_limit=g["new_limit"],
+                                    review_limit=g["review_limit"], legacy_wrong=legacy_wrong)
         pool = q["queue"]
         sig = ("today", tuple(w["id"] for w in pool))
         st.caption(f"기한 지남 {len(q['overdue'])} · 지금 복습 {len(q['due_today'])} · 오늘 이따가 {len(q['later_today'])}"
@@ -147,10 +149,6 @@ def render(*, store, ai, words, all_categories, filter_words, tts_button, on_leg
         random.shuffle(st.session_state.hw_list)
         st.session_state.hw_idx = 0
         _reset_attempt(); st.rerun()
-
-
-def get_int_setting(key: str, default: int) -> int:
-    return int(st.session_state.get(key, default))
 
 
 def _question_card(word, mode, att, tts_button):

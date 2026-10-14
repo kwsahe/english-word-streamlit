@@ -60,6 +60,7 @@ create table if not exists ai_usage (
     request_id text primary key, user_id text not null, feature text not null, model_id text not null,
     tokens_in integer, tokens_out integer, status text not null, created_at text not null);
 create index if not exists ai_usage_user_time_idx on ai_usage (user_id, created_at);
+create table if not exists settings (user_id text primary key, data text not null);
 """
 
 
@@ -213,6 +214,15 @@ class LocalStore:
         return self._rows("select * from ai_usage where user_id = ? and created_at >= ?",
                           (self.user_id, to_utc_iso(since)))
 
+    # ── 사용자 설정(일일 목표량 등) ──
+    def get_settings(self) -> dict:
+        rows = self._rows("select data from settings where user_id = ?", (self.user_id,))
+        return json.loads(rows[0]["data"]) if rows else {}
+
+    def save_settings(self, data: dict) -> None:
+        self._exec("insert or replace into settings (user_id, data) values (?, ?)",
+                   (self.user_id, json.dumps(data, ensure_ascii=False)))
+
 
 # ────────────────────────────────────────────────────────────────────
 class SupabaseStore:
@@ -345,6 +355,12 @@ class SupabaseStore:
                                                            on_conflict="user_id", ignore_duplicates=True))
             profile = self.get_profile()
         return profile
+
+    def get_settings(self) -> dict:
+        return (self.get_profile() or {}).get("settings") or {}
+
+    def save_settings(self, data: dict) -> None:
+        self._run(self.client.table("profiles").update({"settings": data}).eq("user_id", self.user_id))
 
     def save_legacy_state(self, state: dict, mark_imported: bool = False, now: datetime | None = None) -> None:
         patch = {"legacy_state": state}

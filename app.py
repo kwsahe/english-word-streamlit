@@ -583,9 +583,26 @@ if DB_MODE:
     from views import data_tools
     data_tools.legacy_panel(store, PROGRESS_PATH, _ls_raw, {w["no"] for w in words})
 
-tab_study, tab_write, tab_test, tab_inf, tab_wordbook, tab_mgmt, tab_stats = st.tabs(
-    ["📖 학습", "✍️ 쓰기 연습", "📝 시험", "♾️ 무한", "📋 단어장", "✏️ 단어 관리", "📊 통계"]
+tab_today, tab_study, tab_write, tab_test, tab_inf, tab_wordbook, tab_mgmt, tab_stats = st.tabs(
+    ["🏠 오늘", "📖 학습", "✍️ 쓰기 연습", "📝 시험", "♾️ 무한", "📋 단어장", "✏️ 단어 관리", "📊 통계"]
 )
+
+
+def legacy_result(no, correct):
+    """새 복습(FSRS) 결과를 기존 화면(단어장·통계)의 정답/오답 표시에도 반영."""
+    (mark_correct if correct else mark_wrong)(no)
+    if correct:
+        st.session_state.memorized.add(no)
+    save_progress()
+
+
+# ============================================================
+# TAB 0 — 오늘 (FSRS 복습)
+# ============================================================
+with tab_today:
+    from views import today
+    today.render(store=store, words=words, make_choices=make_choices, on_legacy_result=legacy_result,
+                 legacy_wrong=set(st.session_state.wrong))
 
 
 # ============================================================
@@ -694,16 +711,8 @@ with tab_study:
 # ============================================================
 with tab_write:
     from views import handwriting
-
-    def _legacy_result(no, correct):
-        # 기존 화면(단어장·통계)의 정답/오답 표시도 함께 갱신
-        (mark_correct if correct else mark_wrong)(no)
-        if correct:
-            st.session_state.memorized.add(no)
-        save_progress()
-
     handwriting.render(store=store, ai=ai, words=words, all_categories=all_categories,
-                       filter_words=filter_words, tts_button=tts_button, on_legacy_result=_legacy_result,
+                       filter_words=filter_words, tts_button=tts_button, on_legacy_result=legacy_result,
                        legacy_wrong=set(st.session_state.wrong))
 
 
