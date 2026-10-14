@@ -81,22 +81,25 @@ def day_bounds(now: datetime, tz) -> tuple[datetime, datetime]:
 def build_today_queue(words: list[dict], progress: dict[str, dict], now: datetime, tz, *,
                       new_limit: int = 10, review_limit: int = 30, legacy_wrong: set | None = None,
                       recent_wrong_ids: set | None = None) -> dict:
-    """출제 순서: 기한 지난 카드 → 오늘 만기 → 반복 오답 → 새 단어 (학습량 제한 적용).
+    """출제 순서: 기한 지난 카드 → 오늘 만기(지금 가능) → 새 단어 (학습량 제한 적용).
 
-    반복 오답은 FSRS 일정을 앞당기지 않고, 만기가 아닌 카드 중에서 '추가 연습' 후보로만 보여준다.
+    - 오늘 안에 만기지만 아직 시각이 안 된 카드(예: Again 후 10분 뒤)는 'later_today'로 세기만 하고 큐에 넣지 않는다.
+    - 반복 오답은 FSRS 일정을 앞당기지 않고, 만기가 아닌 카드 중 '추가 연습' 후보로만 보여준다.
     """
     today_start, tomorrow = day_bounds(now, tz)
     legacy_wrong = legacy_wrong or set()
     recent_wrong_ids = recent_wrong_ids or set()
-    overdue, due_today, repeat_wrong, fresh = [], [], [], []
+    overdue, due_today, later_today, repeat_wrong, fresh = [], [], [], [], []
     for w in words:
         row = progress.get(w["id"])
         if row is None:
             fresh.append(w)
         elif row["due_at"] < today_start:
             overdue.append((row["due_at"], w))
-        elif row["due_at"] < tomorrow:
+        elif row["due_at"] <= now:
             due_today.append((row["due_at"], w))
+        elif row["due_at"] < tomorrow:
+            later_today.append(w)
         elif row["lapse_count"] >= 2 or w["id"] in recent_wrong_ids:
             repeat_wrong.append((-row["lapse_count"], w))
     overdue.sort(key=lambda x: x[0])
@@ -108,6 +111,7 @@ def build_today_queue(words: list[dict], progress: dict[str, dict], now: datetim
     return {
         "overdue": [w for _, w in overdue],
         "due_today": [w for _, w in due_today],
+        "later_today": later_today,
         "repeat_wrong": [w for _, w in repeat_wrong],
         "new": fresh[:new_limit],
         "new_total": len(fresh),

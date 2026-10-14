@@ -7,6 +7,7 @@ DEFAULTS = {
     "GEMINI_MODEL_MAIN": "gemini-3.6-flash",       # 필기 OCR, 문장 교정, TOEIC 문제
     "GEMINI_MODEL_LITE": "gemini-3.5-flash-lite",  # 예문, 자동완성, 비교표 등 저비용 텍스트
     "ENABLE_AI": "true",
+    "GEMINI_ALLOW_FALLBACK": "true",               # MAIN 실패 시 LITE로 1회 전환(둘 다 무료 모델, 화면에 표시)
     "DAILY_AI_REQUEST_BUDGET": "40",               # 사용자당 최근 24시간 실제 API 호출 상한(보수적 기본값)
     "APP_TIMEZONE": "Asia/Seoul",
     "HANDWRITING_MAX_BYTES": "1500000",

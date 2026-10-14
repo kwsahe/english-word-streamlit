@@ -51,14 +51,16 @@ def test_queue_priority_and_no_fake_dates_for_legacy():
     def row(due, lapses=0):
         return {"due_at": due, "lapse_count": lapses, "fsrs_card": {}, "version": 1}
     progress = {
-        "w1": row(now + timedelta(hours=2)),        # 오늘 만기
+        "w1": row(now - timedelta(minutes=5)),      # 오늘 만기(지금 가능)
         "w2": row(now - timedelta(days=3)),         # 기한 지남
         "w3": row(now + timedelta(days=5), lapses=3),  # 반복 오답(만기 아님)
+        "w5": row(now + timedelta(minutes=10)),     # Again 직후: 오늘 10분 뒤 → 아직 출제 안 함
     }
     q = study.build_today_queue(words, progress, now, SEOUL, new_limit=2, legacy_wrong={6})
-    assert [w["id"] for w in q["queue"]] == ["w2", "w1", "w6", "w4"]   # 기한지남 → 오늘 → 새(legacy 오답 우선)
+    assert [w["id"] for w in q["queue"]] == ["w2", "w1", "w6", "w4"]   # 기한지남 → 지금 만기 → 새(legacy 오답 우선)
     assert [w["id"] for w in q["repeat_wrong"]] == ["w3"]
-    assert q["new_total"] == 3
+    assert [w["id"] for w in q["later_today"]] == ["w5"]
+    assert q["new_total"] == 2
     # legacy 오답 단어도 FSRS 기록은 없음(새 카드 취급)
     assert "w6" not in progress
 
