@@ -460,7 +460,7 @@ class AIService:
                   f"{json.dumps(stats, ensure_ascii=False)[:4000]}")
         key = cache_key("coach", day, self.model_lite)
         if fresh:
-            self.report_bad("coach", key)
+            self.store.cache_invalidate(key)  # 단순 새로고침: 품질 신고(reported)로 세지 않음
         return self.call("coach", CoachTip, prompt, model=self.model_lite, key=key, ttl=timedelta(hours=36),
                          cached_only=cached_only)
 

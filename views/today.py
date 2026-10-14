@@ -1,5 +1,6 @@
 """🏠 오늘 — FSRS 오늘 복습 현황 + 빠른 복습(플래시카드 · 객관식 · 타이핑)."""
 import html
+import random
 import uuid
 from datetime import timedelta
 
@@ -24,7 +25,7 @@ def goals(store) -> dict:
     return st.session_state.wl_goals
 
 
-def render(*, store, ai, words, make_choices, on_legacy_result, legacy_wrong: set):
+def render(*, store, ai, words, on_legacy_result, legacy_wrong: set):
     st.subheader("🏠 오늘의 복습")
     now, tz = utcnow(), app_tz()
     g = goals(store)
@@ -102,7 +103,10 @@ def render(*, store, ai, words, make_choices, on_legacy_result, legacy_wrong: se
             st.markdown(f"<div class='card-back'>{html.escape(word['meaning'])}</div>", unsafe_allow_html=True)
     elif mode == "객관식":
         if "choices" not in att:
-            att["choices"], _ = make_choices(word, "뜻 → 영어", words)
+            # 같은 철자의 다른 뜻(다의어)이 오답 보기로 나오지 않게 철자 기준으로 제외
+            others = list(dict.fromkeys(w["word"] for w in words if w["word"].lower() != word["word"].lower()))
+            att["choices"] = random.sample(others, min(3, len(others))) + [word["word"]]
+            random.shuffle(att["choices"])
         if not att["shown"]:
             cols = st.columns(2)
             for i, choice in enumerate(att["choices"]):

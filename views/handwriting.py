@@ -104,7 +104,8 @@ def render(*, store, ai, words, all_categories, filter_words, tts_button, on_leg
     if not pool:
         st.info("지금 쓸 단어가 없어요. 범위를 바꾸거나 '카테고리·범위'를 선택하세요.")
         return
-    if st.session_state.get("hw_sig") != sig:
+    # 확인·평가 중에는 큐를 고정한다(시간이 지나 만기 카드가 바뀌어도 진행 중인 답안을 잃지 않게)
+    if st.session_state.get("hw_sig") != sig and st.session_state.get("hw_phase", "write") == "write":
         ids = [w["id"] for w in pool]
         if sig[0] == "filter":
             random.shuffle(ids)

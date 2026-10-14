@@ -8,8 +8,9 @@
 """
 import json
 import sqlite3
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from services.config import parse_dt, to_utc_iso
 
@@ -229,11 +230,31 @@ class SupabaseStore:
     """로그인한 사용자의 supabase-py Client를 받아 RLS 범위 안에서만 읽고 쓴다."""
     kind = "supabase"
 
+    READ_TTL_S = 20  # ponytail: 다른 기기의 변경은 최대 20초 뒤 반영. 실시간이 필요하면 Realtime 구독으로
+
     def __init__(self, client, user_id: str):
         self.client = client
         self.user_id = str(user_id)
+        self._cache: dict = {}
 
-    def _run(self, query):
+    def _cached(self, key, fetch):
+        """Streamlit은 버튼마다 화면 전체를 다시 그린다 → 같은 조회를 짧게 재사용해 네트워크 왕복을 줄인다."""
+        hit = self._cache.get(key)
+        if hit and time.monotonic() - hit[0] < self.READ_TTL_S:
+            return hit[1]
+        value = fetch()
+        self._cache[key] = (time.monotonic(), value)
+        return value
+
+    def _since_rows(self, table: str, col: str, since: datetime) -> list[dict]:
+        # 시작 시각을 시 단위로 내려 캐시 키를 고정하고, 돌려줄 때 정확히 다시 거른다
+        floor = since.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        rows = self._cached((table, floor), lambda: self._select_all(table, since=(col, floor)))
+        return [r for r in rows if parse_dt(r[col]) >= since]
+
+    def _run(self, query, write: bool = False):
+        if write:
+            self._cache.clear()  # 이 기기에서 쓴 내용은 다음 읽기에 바로 보이게
         try:
             return query.execute().data
         except Exception as exc:  # 네트워크·권한·제약 위반을 하나로 묶어 상위에서 '저장 실패'로 표시
@@ -259,7 +280,8 @@ class SupabaseStore:
 
     # ── 복습 상태 ──
     def get_progress(self) -> dict[str, dict]:
-        return {str(r["word_id"]): _progress_row(r) for r in self._select_all("word_progress")}
+        rows = self._cached(("word_progress",), lambda: self._select_all("word_progress"))
+        return {str(r["word_id"]): _progress_row(r) for r in rows}
 
     def get_progress_one(self, word_id: str) -> dict | None:
         rows = self._run(self.client.table("word_progress").select("*").eq("word_id", str(word_id)))
@@ -268,7 +290,7 @@ class SupabaseStore:
     def record_review(self, *, attempt_id, word_id, expected_version, fsrs_card, due_at, reviewed_at,
                       rating, correct, mode, duration_ms=None, device_type=None, session_id=None,
                       due_before=None) -> str:
-        data = self._run(self.client.rpc("record_review", {
+        data = self._run(write=True, query=self.client.rpc("record_review", {
             "p_attempt_id": str(attempt_id), "p_word_id": str(word_id), "p_expected_version": expected_version,
             "p_fsrs_card": fsrs_card, "p_due_at": to_utc_iso(due_at), "p_reviewed_at": to_utc_iso(reviewed_at),
             "p_rating": rating, "p_correct": correct, "p_mode": mode, "p_duration_ms": duration_ms,
@@ -279,13 +301,11 @@ class SupabaseStore:
 
     # ── 이력 ──
     def list_events(self, since: datetime) -> list[dict]:
-        rows = self._select_all("review_events", since=("created_at", since))
-        for r in rows:
-            r["created_at"] = parse_dt(r["created_at"])
-        return rows
+        return [{**r, "created_at": parse_dt(r["created_at"])}
+                for r in self._since_rows("review_events", "created_at", since)]
 
     def add_writing_attempt(self, row: dict) -> None:
-        self._run(self.client.table("writing_attempts").upsert({
+        self._run(write=True, query=self.client.table("writing_attempts").upsert({
             "attempt_id": str(row["attempt_id"]), "word_id": str(row["word_id"]), "mode": row["mode"],
             "ocr_text": row.get("ocr_text"), "confirmed_text": row.get("confirmed_text"),
             "feedback": row.get("feedback") or {}, "status": row["status"], "correct": row.get("correct"),
@@ -293,10 +313,10 @@ class SupabaseStore:
         }, on_conflict="attempt_id", ignore_duplicates=True))
 
     def list_writing_attempts(self, since: datetime) -> list[dict]:
-        return self._select_all("writing_attempts", since=("created_at", since))
+        return self._since_rows("writing_attempts", "created_at", since)
 
     def add_test_session(self, row: dict) -> None:
-        self._run(self.client.table("test_sessions").upsert({
+        self._run(write=True, query=self.client.table("test_sessions").upsert({
             "session_id": str(row["session_id"]), "mode": row["mode"], "total": row["total"],
             "correct": row["correct"],
             "started_at": to_utc_iso(row["started_at"]) if row.get("started_at") else None,
@@ -304,7 +324,7 @@ class SupabaseStore:
         }, on_conflict="session_id", ignore_duplicates=True))
 
     def list_test_sessions(self, since: datetime) -> list[dict]:
-        return self._select_all("test_sessions", since=("finished_at", since))
+        return self._since_rows("test_sessions", "finished_at", since)
 
     # ── AI 캐시 / 사용량 ──
     def cache_get(self, key: str, now: datetime) -> dict | None:
@@ -315,22 +335,22 @@ class SupabaseStore:
         return rows[0]["result"]
 
     def cache_put(self, key, *, feature, model_id, prompt_version, result, expires_at, now) -> None:
-        self._run(self.client.table("ai_cache").upsert({
+        self._run(write=True, query=self.client.table("ai_cache").upsert({
             "cache_key": key, "feature": feature, "model_id": model_id, "prompt_version": prompt_version,
             "result": result, "expires_at": to_utc_iso(expires_at) if expires_at else None,
             "valid": True, "created_at": to_utc_iso(now)}, on_conflict="user_id,cache_key"))
 
     def cache_invalidate(self, key: str) -> None:
-        self._run(self.client.table("ai_cache").update({"valid": False}).eq("cache_key", key))
+        self._run(self.client.table("ai_cache").update({"valid": False}).eq("cache_key", key), write=True)
 
     def log_ai_usage(self, row: dict) -> None:
-        self._run(self.client.table("ai_usage").insert({
+        self._run(write=True, query=self.client.table("ai_usage").insert({
             "feature": row["feature"], "model_id": row["model_id"], "tokens_in": row.get("tokens_in"),
             "tokens_out": row.get("tokens_out"), "status": row["status"],
             "created_at": to_utc_iso(row["created_at"])}))
 
     def list_ai_usage(self, since: datetime) -> list[dict]:
-        return self._select_all("ai_usage", since=("created_at", since))
+        return self._since_rows("ai_usage", "created_at", since)
 
     # ── 단어장 / 프로필 (Supabase 전용) ──
     def list_vocabulary(self) -> list[dict]:
@@ -338,21 +358,24 @@ class SupabaseStore:
 
     def upsert_vocabulary(self, rows: list[dict]) -> None:
         for i in range(0, len(rows), 500):
-            self._run(self.client.table("vocabulary").upsert(rows[i:i + 500], on_conflict="word_id"))
+            self._run(self.client.table("vocabulary").upsert(rows[i:i + 500], on_conflict="word_id"), write=True)
 
     def delete_vocabulary(self, word_ids: list[str]) -> None:
         if word_ids:
-            self._run(self.client.table("vocabulary").delete().in_("word_id", [str(w) for w in word_ids]))
+            self._run(self.client.table("vocabulary").delete().in_("word_id", [str(w) for w in word_ids]),
+                      write=True)
 
     def get_profile(self) -> dict | None:
-        rows = self._run(self.client.table("profiles").select("*").eq("user_id", self.user_id))
+        rows = self._cached(("profile",), lambda: self._run(
+            self.client.table("profiles").select("*").eq("user_id", self.user_id)))
         return rows[0] if rows else None
 
     def ensure_profile(self) -> dict:
         profile = self.get_profile()
         if profile is None:
             self._run(self.client.table("profiles").upsert({"user_id": self.user_id},
-                                                           on_conflict="user_id", ignore_duplicates=True))
+                                                           on_conflict="user_id", ignore_duplicates=True),
+                      write=True)
             profile = self.get_profile()
         return profile
 
@@ -360,10 +383,10 @@ class SupabaseStore:
         return (self.get_profile() or {}).get("settings") or {}
 
     def save_settings(self, data: dict) -> None:
-        self._run(self.client.table("profiles").update({"settings": data}).eq("user_id", self.user_id))
+        self._run(self.client.table("profiles").update({"settings": data}).eq("user_id", self.user_id), write=True)
 
     def save_legacy_state(self, state: dict, mark_imported: bool = False, now: datetime | None = None) -> None:
         patch = {"legacy_state": state}
         if mark_imported:
             patch["legacy_imported_at"] = to_utc_iso(now)
-        self._run(self.client.table("profiles").update(patch).eq("user_id", self.user_id))
+        self._run(self.client.table("profiles").update(patch).eq("user_id", self.user_id), write=True)

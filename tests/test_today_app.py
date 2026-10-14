@@ -34,6 +34,8 @@ def test_multiple_choice_wrong_suggests_again_and_updates_legacy(app_test, data_
     at = app_test()
     at.radio(key="today_mode").set_value("객관식").run()
     att = at.session_state.today_att
+    lowered = [c.lower() for c in att["choices"]]
+    assert len(set(lowered)) == 4 and lowered.count(_word(att["word_id"])["word"].lower()) == 1  # 다의어 철자 중복 없음
     wrong_idx = next(i for i, c in enumerate(att["choices"]) if c != _word(att["word_id"])["word"])
     at.button(key=f"today_c_{wrong_idx}").click().run()
     assert at.session_state.today_att["correct"] is False

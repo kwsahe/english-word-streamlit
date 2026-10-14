@@ -76,7 +76,7 @@ def _start_user(user):
     st.session_state.wl_user = {"id": user.id, "email": user.email}
     st.session_state.wl_store = store
     # 다른 계정 데이터가 섞이지 않게 계정별 세션 상태 초기화
-    for k in ("initialized", "wl_vocab", "wl_pending"):
+    for k in ("initialized", "wl_vocab", "wl_pending", "wl_logged_out"):
         st.session_state.pop(k, None)
 
 
@@ -146,7 +146,6 @@ def init():
         path = os.environ.get("WORDLOOP_DB_PATH") or os.path.join(BASE_DIR, "data", "wordloop.db")
         return _local_store(path)
 
-    _flush_js()
     if "wl_store" not in st.session_state and not st.session_state.get("wl_logged_out"):
         # 새로고침 후 이 기기에 저장된 refresh token으로 세션 복구 (첫 실행엔 None → 자동 재실행)
         rt = streamlit_js_eval(js_expressions=f"localStorage.getItem('{RT_KEY}') || ''", key="wl_rt_read")
@@ -162,6 +161,8 @@ def init():
             st.caption("로그인 상태 확인 중…")
     if "wl_store" in st.session_state:
         _ensure_fresh_token()
+    # 복구·갱신으로 회전된 refresh token을 '이번 실행'에서 바로 기록 (다음 새로고침 전에)
+    _flush_js()
     if "wl_store" not in st.session_state:
         _login_form()
         st.stop()

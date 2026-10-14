@@ -32,6 +32,11 @@ def decode_submission(data_url: str, *, max_bytes: int, max_side: int) -> tuple[
         with Image.open(io.BytesIO(raw)) as probe:
             fmt, size = probe.format, probe.size
             probe.verify()
+        if fmt != "PNG":
+            raise HandwritingError("PNG 이미지가 아닙니다.")
+        # 압축 폭탄 방지: 헤더의 픽셀 크기를 디코딩 전에 확인
+        if min(size) < MIN_SIDE or max(size) > max_side:
+            raise HandwritingError("이미지 크기가 허용 범위를 벗어났습니다.")
         with Image.open(io.BytesIO(raw)) as img:
             img.load()
             if img.mode in ("RGBA", "LA", "P"):
@@ -39,12 +44,10 @@ def decode_submission(data_url: str, *, max_bytes: int, max_side: int) -> tuple[
                 bg.alpha_composite(img.convert("RGBA"))
                 img = bg
             gray = img.convert("L")
-    except (UnidentifiedImageError, OSError, SyntaxError, ValueError):
+    except HandwritingError:
+        raise
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError, Image.DecompressionBombError):
         raise HandwritingError("이미지를 읽을 수 없습니다.") from None
-    if fmt != "PNG":
-        raise HandwritingError("PNG 이미지가 아닙니다.")
-    if min(size) < MIN_SIDE or max(size) > max_side:
-        raise HandwritingError("이미지 크기가 허용 범위를 벗어났습니다.")
     # 거의 흰색(240 이상)만 있으면 빈 필기로 본다
     if ImageOps.invert(gray).point(lambda v: 255 if v > 15 else 0).getbbox() is None:
         raise HandwritingError("필기가 비어 있습니다. 먼저 단어를 써 주세요.")

@@ -604,7 +604,7 @@ def legacy_result(no, correct):
 # ============================================================
 with tab_today:
     from views import today
-    today.render(store=store, ai=ai, words=words, make_choices=make_choices, on_legacy_result=legacy_result,
+    today.render(store=store, ai=ai, words=words, on_legacy_result=legacy_result,
                  legacy_wrong=set(st.session_state.wrong))
 
 

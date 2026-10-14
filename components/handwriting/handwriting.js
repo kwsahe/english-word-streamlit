@@ -233,7 +233,7 @@ function createInstance(parentElement) {
   // 사용자 선호(S펜 전용/굵기)는 기기별 localStorage에 기억 — 학습 데이터 아님
   try {
     const pref = JSON.parse(localStorage.getItem('wl_hw_pref') || '{}');
-    if (typeof pref.penOnly === 'boolean') inst.penOnly = pref.penOnly;
+    if (typeof pref.penOnly === 'boolean') { inst.penOnly = pref.penOnly; inst.prefSet = true; }
     if (pref.width >= 3 && pref.width <= 14) inst.baseWidth = pref.width;
   } catch (e) { /* 사용 불가 시 기본값 */ }
   const savePref = () => {
@@ -325,6 +325,12 @@ function createInstance(parentElement) {
   const isEraser = (e) => inst.tool === 'eraser' || e.button === 5 || (e.buttons & 32) === 32;
   function onDown(e) {
     inst.seen.add(e.pointerType);
+    if (e.pointerType === 'pen' && !inst.penOnly && !inst.prefSet) {
+      // 사용자가 직접 고른 적이 없으면 S펜이 처음 감지될 때 S펜 전용을 켠다(손바닥 획 방지).
+      // 갤럭시탭 Chrome은 데스크톱 UA를 보내므로 서버 UA로는 태블릿을 알 수 없다.
+      inst.penOnly = true; inst.prefSet = true; savePref(); refreshButtons();
+      setStatus('S펜이 감지되어 S펜 전용을 켰어요 (손가락 터치는 무시)');
+    }
     if (!acceptsPointer(e.pointerType, inst.penOnly)) {
       if (e.pointerType === 'touch') {
         inst.ignoredTouch++;
@@ -396,7 +402,7 @@ function createInstance(parentElement) {
     } else if (act === 'guide') {
       inst.showGuide = !inst.showGuide; refreshButtons();
     } else if (act === 'penonly') {
-      inst.penOnly = !inst.penOnly; savePref(); refreshButtons();
+      inst.penOnly = !inst.penOnly; inst.prefSet = true; savePref(); refreshButtons();
     }
   });
   root.querySelector('[data-act=width]').value = String(inst.baseWidth);
