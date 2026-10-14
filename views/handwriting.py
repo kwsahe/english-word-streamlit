@@ -63,7 +63,7 @@ def render(*, store, ai, words, all_categories, filter_words, tts_button, on_leg
     with c1:
         mode_label = st.radio("모드", list(MODES), horizontal=True, key="hw_mode")
     with c2:
-        source = st.radio("문제", ["오늘 복습", "카테고리·범위"], horizontal=True, key="hw_source")
+        source = st.radio("문제", ["오늘 복습", "오답 복습", "카테고리·범위"], horizontal=True, key="hw_source")
     mode = MODES[mode_label]
 
     if source == "카테고리·범위":
@@ -74,6 +74,18 @@ def render(*, store, ai, words, all_categories, filter_words, tts_button, on_leg
             scope = st.radio("범위", ["전체", "미암기만", "오답만", "정답 맞춘"], horizontal=True, key="hw_scope")
         pool = filter_words(words, cats, scope)
         sig = ("filter", tuple(sorted(cats)), scope)
+    elif source == "오답 복습":
+        # 다시 쓸 단어 큐: FSRS에서 틀린 적 있는 단어 + 예전 앱 오답 (최근에 많이 틀린 순)
+        try:
+            progress = store.get_progress()
+        except Exception:
+            st.error("기록을 불러오지 못했습니다(동기화 실패).")
+            return
+        lapses = {wid: r["lapse_count"] for wid, r in progress.items() if r["lapse_count"]}
+        pool = [w for w in words if w["id"] in lapses or w["no"] in legacy_wrong]
+        pool.sort(key=lambda w: -lapses.get(w["id"], 0))
+        sig = ("wrong", tuple(w["id"] for w in pool))
+        st.caption(f"다시 쓸 단어 {len(pool)}개 (FSRS 오답 {len(lapses)} · 예전 오답 {len(legacy_wrong)})")
     else:
         try:
             progress = store.get_progress()

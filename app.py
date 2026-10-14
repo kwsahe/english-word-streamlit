@@ -601,7 +601,7 @@ def legacy_result(no, correct):
 # ============================================================
 with tab_today:
     from views import today
-    today.render(store=store, words=words, make_choices=make_choices, on_legacy_result=legacy_result,
+    today.render(store=store, ai=ai, words=words, make_choices=make_choices, on_legacy_result=legacy_result,
                  legacy_wrong=set(st.session_state.wrong))
 
 
@@ -851,7 +851,9 @@ with tab_test:
                                  "correct_ans": correct_ans, "is_correct": is_ok,
                                  "toeic_sentence": td["sentence"] if td else None,
                                  "translation": td.get("translation", "") if td else "",
-                                 "explanation": td.get("explanation", "") if td else ""})
+                                 "explanation": td.get("explanation", "") if td else "",
+                                 "ai_generated": bool(td and td.get("ai_generated")),
+                                 "cache_key": td.get("cache_key") if td else None})
 
             correct_count = sum(1 for r in results if r["is_correct"])
             score = correct_count / len(results) * 100
@@ -897,14 +899,26 @@ with tab_test:
 
         if result_mode == "AI 토익 4지선다":
             with st.expander("✨ AI 토익 문제 해설", expanded=True):
+                st.caption("✨ 표시는 AI가 만든 문제입니다. 문장·정답이 어색하면 🚩로 신고하면 다음부터 새 문제로 바뀝니다. "
+                           f"(AI 문제 {st.session_state.get('test_ai_count', 0)}개 · 나머지는 예문 기반 대체 문제)")
                 for i, r in enumerate(results, start=1):
                     icon = "✅" if r["is_correct"] else "❌"
-                    st.markdown(f"**{icon} Q{i}. {r['toeic_sentence']}**")
+                    mark = "✨ " if r.get("ai_generated") else ""
+                    st.markdown(f"**{icon} Q{i}. {mark}{r['toeic_sentence']}**")
                     st.write(f"정답: **{r['correct_ans']}**")
                     if r.get("translation"):
                         st.caption(f"해석: {r['translation']}")
                     if r.get("explanation"):
                         st.caption(f"해설: {r['explanation']}")
+                    if r.get("cache_key"):
+                        reported = r["cache_key"] in st.session_state.setdefault("ai_reported", set())
+                        if st.button("🚩 이 문제 신고 · 다음에 새로 만들기", key=f"report_q_{i}",
+                                     disabled=reported):
+                            ai.report_bad("toeic", r["cache_key"])
+                            st.session_state.ai_reported.add(r["cache_key"])
+                            st.rerun()
+                        if reported:
+                            st.caption("신고됨 — 이 단어는 다음 AI 시험에서 새 문제로 만듭니다.")
                     st.divider()
 
         correct_rs = [r for r in results if r["is_correct"]]

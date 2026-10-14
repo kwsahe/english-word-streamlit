@@ -24,7 +24,7 @@ def goals(store) -> dict:
     return st.session_state.wl_goals
 
 
-def render(*, store, words, make_choices, on_legacy_result, legacy_wrong: set):
+def render(*, store, ai, words, make_choices, on_legacy_result, legacy_wrong: set):
     st.subheader("🏠 오늘의 복습")
     now, tz = utcnow(), app_tz()
     g = goals(store)
@@ -50,8 +50,20 @@ def render(*, store, words, make_choices, on_legacy_result, legacy_wrong: set):
     m5.metric("최근 7일 정답률", acc, help=f"채점된 {len(graded)}회 기준 (실측)")
     st.caption(f"예상 소요 약 {study.estimate_minutes(len(q['queue']), events)}분 · 오늘 이따가 만기 "
                f"{len(q['later_today'])}개 · 순서: 기한 지남 → 지금 만기 → 새 단어")
-    if q["repeat_wrong"]:
-        st.caption("🔁 반복 오답(추가 연습 추천): " + ", ".join(w["word"] for w in q["repeat_wrong"][:8]))
+    confusing = q["repeat_wrong"] or [w for w in words if w["id"] in recent_wrong]
+    if confusing:
+        st.caption("🔁 반복·최근 오답(추가 연습 추천): " + ", ".join(w["word"] for w in confusing[:8]))
+        if ai.enabled and len(confusing) >= 2 and st.button("🤔 헷갈린 단어 2~3개 비교하기 (AI)", key="confusable"):
+            from services.ai import AIError
+            try:
+                st.session_state.confusable = ai.confusable(confusing[:3]).model_dump()
+            except AIError as exc:
+                st.warning(exc.user_message)
+        if st.session_state.get("confusable"):
+            res = st.session_state.confusable
+            st.table([{"단어": r["word"], "뜻": r["meaning"], "쓰임 차이": r["nuance"], "예문": r["example"]}
+                      for r in res["rows"]])
+            st.caption(f"구별 요령: {res['tip']} (AI 생성 — 참고용)")
 
     with st.expander("⚙️ 하루 목표량 (제안값 — 언제든 바꿀 수 있어요)"):
         c1, c2 = st.columns(2)
