@@ -87,3 +87,50 @@ def _word(word_id):
         if migrate.word_uuid("local", w["no"]) == word_id:
             return w
     raise KeyError(word_id)
+
+
+def test_experiment_start_interleaves_random_group_and_tags_events(app_test, data_copy):
+    at = app_test()
+    at.slider(key="exp_n").set_value(20)
+    at.button(key="exp_start").click().run()
+    assert not at.exception
+    exp = json.loads(_rows(data_copy, "select data from settings")[0][0])["experiment"]
+    assert len(exp["fsrs"]) == len(exp["random"]) == 10
+    first = at.session_state.today_att
+    assert first["word_id"] in exp["fsrs"] and not first.get("experiment")   # FSRS군 새 단어 우선
+    at.button(key="today_show").click().run()
+    at.button(key="today_rate_3").click().run()
+    second = at.session_state.today_att                                       # 노출량 맞춤: 무작위군 1장
+    assert second["word_id"] in exp["random"] and second["experiment"]
+    assert any("🧪 실험" in c.value for c in at.caption)
+    at.button(key="today_show").click().run()
+    at.button(key="today_rate_3").click().run()
+    modes = [m for (m,) in _rows(data_copy, "select mode from review_events order by created_at")]
+    assert modes == ["today:플래시카드", "experiment-random:플래시카드"]
+    assert at.session_state.today_att["word_id"] in exp["fsrs"]               # 다시 FSRS군 차례
+
+
+def test_experiment_posttest_to_result(app_test, data_copy):
+    from datetime import timedelta
+
+    from conftest import ROOT
+    from services import experiment, migrate
+    from services.config import utcnow
+    from services.store import LocalStore
+    words = [{**w, "id": migrate.word_uuid("local", w["no"])} for w in migrate.read_excel_words(str(ROOT / "Word.xlsx"))]
+    exp = experiment.create(words, {}, n=20, seed=11, now=utcnow() - timedelta(days=30))
+    LocalStore(str(data_copy / "wordloop.db")).save_settings({"experiment": exp})
+    by_id = {w["id"]: w for w in words}
+    at = app_test()
+    # 재시험 대상 단어는 오늘 큐에서 빠진다
+    assert at.session_state.today_att["word_id"] not in set(exp["fsrs"]) | set(exp["random"])
+    for i in range(20):
+        wid = experiment.next_posttest(json.loads(_rows(data_copy, "select data from settings")[0][0])["experiment"])
+        answer = by_id[wid]["word"] if (wid in exp["fsrs"] or i % 2) else "zzz"
+        at.text_input(key="exp_post_typed").input(answer)
+        at.button(key="FormSubmitter:exp_post-제출").click().run()
+        assert not at.exception
+    saved = json.loads(_rows(data_copy, "select data from settings")[0][0])["experiment"]
+    assert saved["status"] == "done" and len(saved["posttest"]) == 20
+    assert _rows(data_copy, "select count(*) from review_events")[0][0] == 0   # 재시험은 FSRS에 반영 안 함
+    assert any("정답률 차이" in m.value for m in at.markdown)

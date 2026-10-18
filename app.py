@@ -6,20 +6,19 @@ import os
 import html
 import json
 import random
-import time
 import uuid
 from datetime import datetime
 
-import base64
 
 import openpyxl
 from openpyxl.worksheet.formula import ArrayFormula
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval
 
-from services import migrate
+from components.browser import local_storage, tts_button
+
+from services import migrate, sync
 from services.config import app_tz, utcnow
 from services import ai as ai_mod
 from services.ai import AIError, format_example
@@ -264,23 +263,21 @@ def save_progress():
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    # 브라우저 localStorage 저장 (클라우드/모바일 지속성)
-    _save_to_localstorage(data)
+    # 브라우저 localStorage 저장은 앱 맨 끝에서 매 실행 현재 상태로 기록(_sync_browser_progress)
 
 
-def _save_to_localstorage(data: dict):
-    """base64로 인코딩해 localStorage에 저장 (특수문자 이슈 방지)."""
-    raw  = json.dumps(data, ensure_ascii=False)
-    b64  = base64.b64encode(raw.encode()).decode()
-    components.html(f"""
-    <script>
-    (function() {{
-        try {{
-            localStorage.setItem('{LS_KEY}', atob('{b64}'));
-        }} catch(e) {{ console.warn('localStorage write failed', e); }}
-    }})();
-    </script>
-    """, height=0, width=0)
+def _sync_browser_progress():
+    """로컬 모드: 현재 진도를 이 브라우저 localStorage에 기록(클라우드/모바일 지속성).
+    저장된 값을 먼저 읽어 적용한 뒤에만 쓴다 → 빈 진도로 기존 기록을 덮어쓰지 않음."""
+    if DB_MODE or not st.session_state.get("_ls_applied"):
+        return
+    data = {
+        "memorized": list(st.session_state.memorized),
+        "wrong":     list(st.session_state.wrong),
+        "correct":   list(st.session_state.correct_words),
+        "sessions":  st.session_state.sessions,
+    }
+    local_storage(LS_KEY, key="ls_progress_write", write=json.dumps(data, ensure_ascii=False), report=False)
 
 
 # ============================================================
@@ -330,30 +327,6 @@ def mark_correct(no):
 def mark_wrong(no):
     st.session_state.wrong.add(no)
     st.session_state.correct_words.discard(no)
-
-
-def tts_button(word: str, key: str = "tts"):
-    # 단어는 미신뢰 입력: HTML 속성은 html.escape, JS 문자열은 JSON + '<' 이스케이프(</script> 탈출 방지)
-    title = html.escape(word, quote=True)
-    js_word = json.dumps(word).replace("<", "\\u003c")
-    components.html(f"""
-    <button onclick="speak()" title="{title} 발음 듣기" style="
-        background:#1565C0;color:white;border:none;border-radius:10px;
-        padding:10px 20px;font-size:1.1rem;cursor:pointer;
-        display:flex;align-items:center;gap:6px;margin:4px auto;
-        min-height:48px;touch-action:manipulation;">
-        🔊 발음 듣기
-    </button>
-    <script>
-    function speak() {{
-        window.speechSynthesis.cancel();
-        var u = new SpeechSynthesisUtterance({js_word});
-        u.lang = "en-US";
-        u.rate = 0.85;
-        window.speechSynthesis.speak(u);
-    }}
-    </script>
-    """, height=52)
 
 
 # ── AI: 모든 Gemini 호출은 services/ai.py(AIService)를 거친다 (캐시·일일 상한·재시도·검증) ──
@@ -495,7 +468,8 @@ all_categories = sorted(set(w["category"] for w in words))
 
 # localStorage 값 요청 (첫 렌더: None 반환 → 자동 rerun → 두 번째 렌더: 실제 값)
 _ls_raw = streamlit_js_eval(
-    js_expressions=f"localStorage.getItem('{LS_KEY}')",
+    # 값이 없으면 '' (None이면 '아직 못 읽음'과 구분이 안 돼 이 브라우저에 진도를 한 번도 저장하지 못함)
+    js_expressions=f"localStorage.getItem('{LS_KEY}') || ''",
     want_output=True,
     key="ls_init",
 )
@@ -867,9 +841,9 @@ with tab_test:
                 "score": round(score, 1), "mode": mode, "direction": direction,
             }
             st.session_state.sessions.append(session)
-            account.save_with_status("시험 기록", store.add_test_session, {
+            account.submit(store, "시험 기록", sync.test_session_item({
                 "session_id": uuid.uuid4(), "mode": mode, "total": len(results),
-                "correct": correct_count, "finished_at": utcnow()}, queue=True)
+                "correct": correct_count, "finished_at": utcnow()}))
             st.session_state.test_result = {
                 "results": results, "score": score, "correct_count": correct_count,
             }
@@ -1564,3 +1538,6 @@ with tab_stats:
             st.session_state.correct_words = set()
             st.session_state.sessions      = []
             save_progress(); st.rerun()
+
+
+_sync_browser_progress()

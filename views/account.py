@@ -4,6 +4,8 @@
 - 설정이 있으면: 이메일+비밀번호 로그인 필수, 모든 학습 기록은 로그인 세션(RLS)으로 Supabase에 저장.
 - 새로고침 후 세션 복구: refresh token만 이 기기 localStorage('wl_rt')에 둔다(access token은 저장 안 함).
   로그아웃 시 토큰과 이 기기의 필기 초안(IndexedDB 'wordloop')을 함께 삭제한다.
+- 미전송 기록은 데이터(JSON)로 이 브라우저 localStorage('wl_pending:{user}')에 보관 → 새로고침 후에도 재전송.
+  로그아웃하면 계정 혼동을 막기 위해 함께 삭제한다.
 """
 import hashlib
 import json
@@ -13,6 +15,8 @@ import time
 import streamlit as st
 from streamlit_js_eval import streamlit_js_eval
 
+from components.browser import local_storage
+from services import study, sync
 from services.config import get_setting, utcnow
 from services.store import LocalStore, StoreError, SupabaseStore
 
@@ -102,7 +106,9 @@ def logout():
     for k in list(st.session_state.keys()):
         if k not in keep:
             del st.session_state[k]
-    _queue_js(f"localStorage.removeItem('{RT_KEY}'); indexedDB.deleteDatabase('wordloop')")
+    _queue_js(f"localStorage.removeItem('{RT_KEY}'); indexedDB.deleteDatabase('wordloop'); "
+              "Object.keys(localStorage).filter(k => k.startsWith('wl_pending:'))"
+              ".forEach(k => localStorage.removeItem(k))")
     st.session_state.wl_logged_out = True
     return pending
 
@@ -170,23 +176,45 @@ def init():
 
 
 # ── 동기화 상태 + 미전송 큐 ──
-def save_with_status(label: str, fn, *args, queue: bool = False, **kwargs):
-    """DB 저장 성공을 확인한 뒤에만 '저장됨'으로 표시. 실패 시 queue=True면 미전송 큐에 보관(멱등 작업만)."""
+def save_with_status(label: str, fn, *args, **kwargs):
+    """DB 저장 성공을 확인한 뒤에만 '저장됨'으로 표시. 실패하면 None (큐에 넣지 않는 작업용)."""
     try:
         result = fn(*args, **kwargs)
         st.session_state.wl_sync = {"state": "saved", "at": utcnow(), "label": label}
         return result
     except StoreError as exc:
         st.session_state.wl_sync = {"state": "failed", "at": utcnow(), "label": label, "error": str(exc)[:120]}
-        if queue:
-            st.session_state.setdefault("wl_pending", []).append((label, fn, args, kwargs))
         return None
 
 
-def retry_pending():
+def submit(store, label: str, item: dict):
+    """학습 기록 1건 저장. 실패하면 미전송 큐(브라우저 보관)에 넣고 None. 같은 항목은 한 번만 큐에 들어간다."""
+    try:
+        result = sync.apply(store, item)
+        st.session_state.wl_sync = {"state": "saved", "at": utcnow(), "label": label}
+        return result
+    except (StoreError, study.ReviewConflict) as exc:
+        st.session_state.wl_sync = {"state": "failed", "at": utcnow(), "label": label, "error": str(exc)[:120]}
+        st.session_state.wl_pending = sync.merge(st.session_state.get("wl_pending", []), [item])
+        return None
+
+
+def retry_pending(store):
     pending, st.session_state.wl_pending = st.session_state.get("wl_pending", []), []
-    for label, fn, args, kwargs in pending:
-        save_with_status(label, fn, *args, queue=True, **kwargs)
+    for item in pending:
+        submit(store, "미전송 기록 재전송", item)
+
+
+def _sync_pending_storage(store):
+    """이 브라우저에 보관된 미전송 큐를 처음 한 번 읽어 합치고, 이후엔 현재 큐를 그대로 기록한다.
+    읽기 전에 쓰면 보관된 항목을 지울 수 있으므로, 읽기가 끝난 뒤부터만 쓴다."""
+    loaded = st.session_state.get("wl_pending_loaded", False)
+    pending = st.session_state.get("wl_pending", [])
+    stored = local_storage(f"wl_pending:{store.user_id}", key="wl_pending_store",
+                           write=sync.dumps(pending) if loaded else None)
+    if not loaded and stored is not None:
+        st.session_state.wl_pending = sync.merge(sync.loads(stored), pending)
+        st.session_state.wl_pending_loaded = True
 
 
 def sidebar(store, ai_status: str):
@@ -196,17 +224,20 @@ def sidebar(store, ai_status: str):
             st.caption(f"로그인: {st.session_state.wl_user['email']}")
         else:
             st.caption("로컬 모드 (이 PC에만 저장). PC↔태블릿 동기화는 Supabase 설정 후 로그인하세요.")
-        sync = st.session_state.get("wl_sync")
+        _sync_pending_storage(store)
+        status = st.session_state.get("wl_sync")
         pending = st.session_state.get("wl_pending", [])
         if pending:
-            st.error(f"동기화 실패 — 미전송 {len(pending)}건 (이 화면을 닫으면 사라집니다)")
+            kept = "이 브라우저에 보관 중 — 새로고침해도 유지" if st.session_state.get("wl_pending_loaded") \
+                else "보관 준비 중"
+            st.error(f"동기화 실패 — 미전송 {len(pending)}건 ({kept})")
             if st.button("🔁 재전송", key="wl_retry", width="stretch"):
-                retry_pending()
+                retry_pending(store)
                 st.rerun()
-        elif sync and sync["state"] == "failed":
-            st.error(f"저장 실패: {sync['label']} — 네트워크 확인 후 다시 시도하세요.")
-        elif sync:
-            st.success(f"저장됨 · {sync['label']}")
+        elif status and status["state"] == "failed":
+            st.error(f"저장 실패: {status['label']} — 네트워크 확인 후 다시 시도하세요.")
+        elif status:
+            st.success(f"저장됨 · {status['label']}")
         else:
             st.caption("아직 이번 접속에서 저장한 기록이 없습니다.")
         st.caption(ai_status)

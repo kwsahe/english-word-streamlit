@@ -59,7 +59,18 @@ Supabase에서는 `public.record_review`(plpgsql, `security invoker`)가, 로컬
 
 - `views/account.py`: supabase-py 클라이언트를 세션별로 만들고 자동 갱신을 끔. 만료 2분 전 직접 갱신하고, 회전된 refresh token을 이 기기 localStorage(`wl_rt`)에 다시 씀. access token은 저장하지 않음.
 - 새로고침 시 `wl_rt`로 세션 복구. 실패하면 토큰 삭제 후 로그인 화면.
-- 로그아웃: 세션 상태 전체 삭제, `wl_rt` 삭제, 이 기기 IndexedDB `wordloop` 삭제. 미전송 큐는 폐기(버튼 옆에 경고).
+- 로그아웃: 세션 상태 전체 삭제, `wl_rt` 삭제, 이 기기 IndexedDB `wordloop` 삭제, 미전송 큐 `wl_pending:*` 삭제(버튼 옆에 경고).
+
+## 미전송 큐 (`services/sync.py`)
+
+- 저장 실패(네트워크·권한·동시 저장 충돌)한 학습 기록은 함수가 아니라 JSON 데이터(`op`, `id`, 단어 ID, 평가, 확정 답안 등)로 큐에 넣는다. 토큰·이메일은 담지 않는다.
+- 큐는 이 브라우저 localStorage `wl_pending:{user_id}`에 보관된다(Components v2 `components/browser.py`). 새 세션은 먼저 보관분을 읽어 합친 뒤에만 쓴다 → 빈 큐로 보관분을 덮어쓰지 않음.
+- 모든 항목은 `attempt_id`/`session_id`로 멱등이라 재전송을 여러 번 해도 한 번만 반영된다.
+
+## 브라우저 기능 (`components/browser.py`)
+
+- TTS 발음 버튼과 localStorage 읽기/쓰기를 Components v2로 구현(사용 중단 예고된 `st.components.v1.html` 제거). 단어는 data로만 넘기고 `textContent`로 넣는다.
+- 로컬 모드의 기존 진도 브라우저 백업(`ew_progress`)은 실행마다 앱 끝에서 현재 상태로 기록한다. 브라우저 값을 먼저 읽은 뒤에만 쓴다.
 - service_role/secret 키는 앱 어디에도 쓰지 않음. 사용자 ID는 항상 Auth 세션(`auth.uid()`)에서 나옴.
 
 ## 파일 지도

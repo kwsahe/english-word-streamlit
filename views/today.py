@@ -6,7 +6,7 @@ from datetime import timedelta
 
 import streamlit as st
 
-from services import study
+from services import experiment, study, sync
 from services.config import app_tz, utcnow
 from services.handwriting import is_correct_spelling
 from services.store import StoreError
@@ -36,8 +36,12 @@ def render(*, store, ai, words, on_legacy_result, legacy_wrong: set):
         st.error("복습 기록을 불러오지 못했습니다(동기화 실패). 아래 기존 학습 탭은 그대로 쓸 수 있어요.")
         return
     recent_wrong = {e["word_id"] for e in events if e.get("correct") is False}
+    from views import experiment as exp_view
+    exp = exp_view.load(store)
     q = study.build_today_queue(words, progress, now, tz, new_limit=g["new_limit"], review_limit=g["review_limit"],
-                                legacy_wrong=legacy_wrong, recent_wrong_ids=recent_wrong)
+                                legacy_wrong=legacy_wrong, recent_wrong_ids=recent_wrong,
+                                exclude=experiment.excluded_ids(exp, now),
+                                priority_new=experiment.priority_new(exp, now))
     graded = [e for e in events if e.get("correct") is not None]
     acc = f"{sum(e['correct'] for e in graded) / len(graded) * 100:.0f}%" if graded else "기록 없음"
     today_start, _ = study.day_bounds(now, tz)
@@ -82,16 +86,23 @@ def render(*, store, ai, words, on_legacy_result, legacy_wrong: set):
     mode = st.radio("방식", ["플래시카드", "객관식", "타이핑"], horizontal=True, key="today_mode")
     skipped = st.session_state.setdefault("today_skipped", set())
     queue = [w for w in q["queue"] if w["id"] not in skipped]
+    by_id = {w["id"]: w for w in words}
+    random_card = _experiment_random_card(exp, events, today_start, now, by_id)
+    if random_card:
+        queue = [random_card] + queue
     if not queue:
         st.success("오늘 할 복습을 모두 마쳤어요! 🎉 (건너뛴 카드는 새로고침하면 다시 나옵니다)")
+        exp_view.render(store=store, words=words, progress=progress, events=events)
         return
     word = queue[0]
     att = st.session_state.get("today_att")
     if not att or att["word_id"] != word["id"] or att["mode"] != mode:
         att = st.session_state.today_att = {"word_id": word["id"], "mode": mode, "attempt_id": str(uuid.uuid4()),
-                                            "started": now, "correct": None, "shown": False}
+                                            "started": now, "correct": None, "shown": False,
+                                            "experiment": word is random_card}
     row = progress.get(word["id"])
-    st.caption(f"남은 카드 {len(queue)}개 · {'복습' if row else '새 단어'} · No.{word['no']} · {word['category']}")
+    kind = "🧪 실험(무작위군)" if att.get("experiment") else ("복습" if row else "새 단어")
+    st.caption(f"남은 카드 {len(queue)}개 · {kind} · No.{word['no']} · {word['category']}")
     st.markdown(f"<div class='card-front'>{html.escape(word['meaning'] if mode != '플래시카드' else word['word'])}</div>",
                 unsafe_allow_html=True)
 
@@ -130,7 +141,27 @@ def render(*, store, ai, words, on_legacy_result, legacy_wrong: set):
     if st.button("⏭️ 이 카드 건너뛰기", key="today_skip"):
         skipped.add(word["id"])
         st.session_state.pop("today_att", None)
+        st.session_state.pop("exp_random_pick", None)
         st.rerun()
+    exp_view.render(store=store, words=words, progress=progress, events=events)
+
+
+def _experiment_random_card(exp, events, today_start, now, by_id):
+    """실험 학습 기간: 오늘 FSRS군을 복습한 만큼 무작위군 단어를 섞는다(같은 카드는 저장 전까지 고정)."""
+    if experiment.phase(exp, now) != "learning":
+        return None
+    today_events = [e for e in events if e["created_at"] >= today_start]
+    if experiment.random_quota(exp, today_events) <= 0:
+        st.session_state.pop("exp_random_pick", None)
+        return None
+    pick = st.session_state.get("exp_random_pick")
+    if pick not in exp["random"] or pick not in by_id:
+        candidates = [w for w in exp["random"] if w in by_id]
+        if not candidates:
+            return None
+        pick = random.Random().choice(candidates)
+        st.session_state.exp_random_pick = pick
+    return by_id[pick]
 
 
 def _safe_settings(store) -> dict:
@@ -152,14 +183,11 @@ def _rating_buttons(store, word, row, att, mode, on_legacy_result):
         if col.button(f"{study.RATING_LABELS[r]} · {when} 후", key=f"today_rate_{r}", width="stretch",
                       type="primary" if r == suggested else "secondary"):
             duration = int(min((now - att["started"]).total_seconds(), 3600) * 1000)
-            try:
-                res = account.save_with_status(
-                    "오늘 복습", study.submit_review, store, word_id=word["id"], rating=r,
-                    mode=f"today:{mode}", correct=att["correct"], attempt_id=att["attempt_id"], now=now,
-                    duration_ms=duration, device_type=account.device_type(), queue=True)
-            except study.ReviewConflict as exc:
-                st.error(str(exc))
-                return
+            event_mode = f"experiment-random:{mode}" if att.get("experiment") else f"today:{mode}"
+            res = account.submit(store, "오늘 복습", sync.review_item(
+                word_id=word["id"], rating=r, mode=event_mode, correct=att["correct"],
+                attempt_id=att["attempt_id"], now=now, duration_ms=duration, device_type=account.device_type()))
+            st.session_state.pop("exp_random_pick", None)
             if res:
                 st.toast(f"저장됨 · 다음 복습 {res['due_at'].astimezone(app_tz()).strftime('%m/%d %H:%M')}")
                 if att["correct"] is not None:

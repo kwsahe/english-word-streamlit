@@ -31,8 +31,13 @@
 - `?tab=` 시작 탭 지정(태블릿 홈 화면 바로가기)
 - README·ARCHITECTURE·DATA_MODEL·TABLET_QA·AI_EVALUATION·DEPLOYMENT, GitHub Actions(단위 + 로컬 Supabase 통합)
 
+## 추가 개발 (2026-10-18)
+- TTS 버튼·진도 브라우저 저장을 Components v2로 교체 (`st.components.v1.html` 사용 제거), 브라우저 진도가 비어 있을 때 한 번도 저장되지 않던 문제 수정
+- 미전송 기록을 JSON 데이터로 브라우저에 보관 → 새로고침 후 복원·재전송, 로그아웃 시 삭제
+- 🧪 FSRS vs 무작위 복습 실험: 시드 고정 배정, 노출량 맞춤 무작위 출제, 대기, 재시험, 부트스트랩 신뢰구간 분석
+- 바탕화면 실행용 `start_wordloop.bat` + 아이콘(`assets/wordloop.ico`)
+
 ## 알려진 미완료
 - 갤럭시탭 실기기 QA (docs/TABLET_QA.md §3)
 - 사용자 Supabase 클라우드 프로젝트 연결·운영 배포 (사용자 승인 필요)
-- FSRS vs 무작위 비교 실험의 무작위 출제 모드
-- `st.components.v1.html`(TTS 버튼, localStorage 쓰기)은 Streamlit에서 사용 중단 예고 상태 — 버전 고정으로 동작 유지, 이후 v2로 교체 필요
+- 기존 진도 localStorage 읽기와 로그인 토큰 저장은 아직 `streamlit-js-eval`(v1 커스텀 컴포넌트, 사용 중단 경고 없음)을 사용

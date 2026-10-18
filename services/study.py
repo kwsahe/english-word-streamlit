@@ -80,7 +80,8 @@ def day_bounds(now: datetime, tz) -> tuple[datetime, datetime]:
 
 def build_today_queue(words: list[dict], progress: dict[str, dict], now: datetime, tz, *,
                       new_limit: int = 10, review_limit: int = 30, legacy_wrong: set | None = None,
-                      recent_wrong_ids: set | None = None) -> dict:
+                      recent_wrong_ids: set | None = None, exclude: set | None = None,
+                      priority_new: set | None = None) -> dict:
     """출제 순서: 기한 지난 카드 → 오늘 만기(지금 가능) → 새 단어 (학습량 제한 적용).
 
     - 오늘 안에 만기지만 아직 시각이 안 된 카드(예: Again 후 10분 뒤)는 'later_today'로 세기만 하고 큐에 넣지 않는다.
@@ -89,8 +90,11 @@ def build_today_queue(words: list[dict], progress: dict[str, dict], now: datetim
     today_start, tomorrow = day_bounds(now, tz)
     legacy_wrong = legacy_wrong or set()
     recent_wrong_ids = recent_wrong_ids or set()
+    exclude, priority_new = exclude or set(), priority_new or set()  # 실험 중인 단어 제외/우선
     overdue, due_today, later_today, repeat_wrong, fresh = [], [], [], [], []
     for w in words:
+        if w["id"] in exclude:
+            continue
         row = progress.get(w["id"])
         if row is None:
             fresh.append(w)
@@ -106,7 +110,7 @@ def build_today_queue(words: list[dict], progress: dict[str, dict], now: datetim
     due_today.sort(key=lambda x: x[0])
     repeat_wrong.sort(key=lambda x: x[0])
     # 새 단어: 예전 앱에서 틀렸던 단어(legacy)를 먼저, 그다음 원본 번호 순
-    fresh.sort(key=lambda w: (w["no"] not in legacy_wrong, w["no"]))
+    fresh.sort(key=lambda w: (w["id"] not in priority_new, w["no"] not in legacy_wrong, w["no"]))
     reviews = [w for _, w in overdue + due_today][:review_limit]
     return {
         "overdue": [w for _, w in overdue],

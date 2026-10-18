@@ -7,7 +7,7 @@ from datetime import datetime
 import streamlit as st
 
 from components.handwriting import handwriting_canvas
-from services import study
+from services import experiment, study, sync
 from services.ai import AIError
 from services.config import app_tz, get_int, utcnow
 from services.handwriting import HandwritingError, contains_target, decode_submission, is_correct_spelling
@@ -92,10 +92,13 @@ def render(*, store, ai, words, all_categories, filter_words, tts_button, on_leg
         except Exception:
             st.error("복습 일정을 불러오지 못했습니다(동기화 실패). '카테고리·범위'로 계속 연습할 수 있어요.")
             return
+        from views.experiment import load as load_experiment
         from views.today import goals
-        g = goals(store)
-        q = study.build_today_queue(words, progress, utcnow(), tz, new_limit=g["new_limit"],
-                                    review_limit=g["review_limit"], legacy_wrong=legacy_wrong)
+        g, exp, now = goals(store), load_experiment(store), utcnow()
+        q = study.build_today_queue(words, progress, now, tz, new_limit=g["new_limit"],
+                                    review_limit=g["review_limit"], legacy_wrong=legacy_wrong,
+                                    exclude=experiment.excluded_ids(exp, now),
+                                    priority_new=experiment.priority_new(exp, now))
         pool = q["queue"]
         sig = ("today", tuple(w["id"] for w in pool))
         st.caption(f"기한 지남 {len(q['overdue'])} · 지금 복습 {len(q['due_today'])} · 오늘 이따가 {len(q['later_today'])}"
@@ -347,17 +350,10 @@ def _save(store, word, mode, att, rating, now, on_legacy_result):
                    "feedback": feedback, "status": att.get("status", "manual"), "correct": att.get("correct"),
                    "created_at": now}
 
-    def write():
-        store.add_writing_attempt(writing_row)
-        return study.submit_review(store, word_id=word["id"], rating=rating, mode=f"handwriting:{mode}",
-                                   correct=att.get("correct"), attempt_id=att["attempt_id"], now=now,
-                                   duration_ms=duration, device_type=account.device_type(),
-                                   session_id=st.session_state.setdefault("hw_session_id", str(uuid.uuid4())))
-    try:
-        res = account.save_with_status("필기 복습", write, queue=True)
-    except study.ReviewConflict as exc:
-        st.error(str(exc))
-        return
+    res = account.submit(store, "필기 복습", sync.review_item(
+        word_id=word["id"], rating=rating, mode=f"handwriting:{mode}", correct=att.get("correct"),
+        attempt_id=att["attempt_id"], now=now, duration_ms=duration, device_type=account.device_type(),
+        session_id=st.session_state.setdefault("hw_session_id", str(uuid.uuid4())), writing=writing_row))
     if res:
         due = res["due_at"].astimezone(app_tz()).strftime("%m/%d %H:%M")
         st.toast(f"저장됨 · 다음 복습 {due}" + (" (이미 저장된 기록)" if res["status"] == "duplicate" else ""))
