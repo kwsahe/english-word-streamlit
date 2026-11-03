@@ -4,7 +4,7 @@
 
 **Python · Streamlit 1.65 · Components v2 · Supabase(PostgreSQL+Auth+RLS) · Gemini API · py-fsrs**
 
-기존 배포(v1): <https://honeyenglish.streamlit.app/> — v2는 `feature/wordloop-ai-v2` 브랜치에서 개발 중이며 운영 배포 전입니다.
+기존 배포(v1): <https://honeyenglish.streamlit.app/> — v2는 [PR #1](https://github.com/kwsahe/english-word-streamlit/pull/1)(`feature/wordloop-ai-v2` → `master`)에서 검토 중이며 운영 배포 전입니다. 갤럭시탭 실기기 QA 후 머지합니다.
 
 ---
 
@@ -28,7 +28,8 @@
         Streamlit 앱 (app.py + views/*) ── 기존 7개 탭 유지 + 🏠 오늘 + 📊 분석
                  │
    services/ ─ handwriting(PNG 검증·철자 판정) · ai(Gemini 구조화 출력·캐시·한도·재시도·회로차단)
-             ─ study(FSRS 계산 + 멱등 저장) · store(LocalStore | SupabaseStore) · analytics · migrate
+             ─ study(FSRS 계산 + 멱등 저장) · store(LocalStore | SupabaseStore) · sync(미전송 큐)
+             ─ analytics · experiment(FSRS vs 무작위) · migrate
                  │                                  │
        로컬 모드: SQLite(이 PC)          로그인 모드: Supabase PostgreSQL (RLS, record_review RPC)
 ```
@@ -96,14 +97,14 @@ py -3.12 -m venv .venv
 - AI를 켜려면 `.streamlit/secrets.toml.example`을 `.streamlit/secrets.toml`로 복사해 `GEMINI_API_KEY`를 넣습니다. 연결 확인: `.venv\Scripts\python scripts\gemini_smoke.py`
 - PC·태블릿 동기화는 Supabase 프로젝트를 만들고 `SUPABASE_URL`, `SUPABASE_ANON_KEY`를 넣은 뒤 마이그레이션을 적용합니다([docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 - 갤럭시탭 홈 화면 바로가기를 `.../?tab=write`로 만들면 S펜 쓰기 연습 탭이 바로 열립니다.
-- 같은 Wi-Fi의 태블릿에서 PC 서버 접속: `start_server.bat`
+- 같은 Wi-Fi의 태블릿에서 PC 서버 접속: `start_wordloop.bat` 실행 → 창에 표시되는 `http://<PC IP>:8501/?tab=write`를 태블릿에서 엽니다. 바탕화면 바로가기를 이 파일로 만들고 아이콘을 `assets/wordloop.ico`로 지정하면 더블클릭으로 시작할 수 있습니다.
 
 ### 테스트
 
 ```bash
 .venv\Scripts\python -m pytest -q                 # AI·DB 없이 (Supabase 테스트는 자동 건너뜀)
 node --test tests/js/handwriting.test.mjs         # 필기 컴포넌트 로직
-npx supabase start                                # (선택) 로컬 Supabase로 RLS·동기화 통합 테스트
+npx -y supabase@2.120.0 start                     # (선택, Docker 필요) 로컬 Supabase로 RLS·동기화 통합 테스트
 ```
 
 Supabase 통합 테스트는 `WORDLOOP_TEST_SUPABASE_URL`, `WORDLOOP_TEST_SUPABASE_ANON_KEY`(로컬 값만)를 설정하면 실행됩니다. CI는 `.github/workflows/tests.yml`.
@@ -125,11 +126,13 @@ Supabase 통합 테스트는 `WORDLOOP_TEST_SUPABASE_URL`, `WORDLOOP_TEST_SUPABA
 ```text
 app.py                      # 진입점: 기존 7개 탭 + 오늘/분석 연결
 components/handwriting/     # S펜 캔버스 (Components v2: JS/CSS)
-services/                   # ai · handwriting · study(FSRS) · store · migrate · analytics · config
-views/                      # account(로그인·동기화) · handwriting · today · dashboard · data_tools · ai_ui
+components/browser.py       # TTS 발음 버튼 · localStorage 읽기/쓰기 (Components v2)
+services/                   # ai · handwriting · study(FSRS) · store · sync · experiment · migrate · analytics · config
+views/                      # account(로그인·동기화) · handwriting · today · experiment · dashboard · data_tools · ai_ui
 supabase/migrations/        # 스키마 + GRANT + RLS + record_review RPC (되돌리기: supabase/rollback/)
 scripts/                    # gemini_smoke.py(무료 API 확인) · seed_demo.py(합성 데모 데이터)
 tests/                      # pytest + tests/js (node:test)
 docs/                       # ARCHITECTURE · DATA_MODEL · TABLET_QA · AI_EVALUATION · DEPLOYMENT · CHANGELOG_V2
+start_wordloop.bat          # 같은 Wi-Fi 태블릿용 서버 실행 (아이콘: assets/wordloop.ico)
 Word.xlsx                   # 원본 단어장 (가져오기·백업용, 앱이 로그인 모드에서는 수정하지 않음)
 ```
