@@ -3,19 +3,26 @@
 import re
 import io
 import os
+import html
 import json
 import random
-import time
+import uuid
 from datetime import datetime
 
-import base64
 
 import openpyxl
 from openpyxl.worksheet.formula import ArrayFormula
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit_js_eval import streamlit_js_eval
+
+from components.browser import local_storage, tts_button
+
+from services import migrate, sync
+from services.config import app_tz, utcnow
+from services import ai as ai_mod
+from services.ai import AIError, format_example
+from views import account, ai_ui
 
 # ============================================================
 # 페이지 설정 (반드시 첫 번째 Streamlit 호출)
@@ -23,7 +30,7 @@ from streamlit_js_eval import streamlit_js_eval
 st.set_page_config(
     page_title="영단어 학습기",
     page_icon="📚",
-    layout="centered",
+    layout="wide",   # 갤럭시탭 가로: 문제 40% / 필기 60%. 아래 CSS로 최대 폭 제한
     initial_sidebar_state="collapsed",
 )
 
@@ -33,7 +40,7 @@ st.set_page_config(
 st.markdown("""
 <style>
 /* ── 전체 패딩 축소 (모바일) ── */
-.block-container { padding-top: 1rem !important; padding-bottom: 2rem !important; }
+.block-container { padding-top: 1rem !important; padding-bottom: 2rem !important; max-width: 1200px; }
 
 /* ── 메트릭 카드 ── */
 [data-testid="metric-container"] {
@@ -127,11 +134,15 @@ st.markdown("""
 # 경로
 # ============================================================
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-EXCEL_PATH    = os.path.join(BASE_DIR, "Word.xlsx")
-PROGRESS_PATH = os.path.join(BASE_DIR, "progress.json")
+# 테스트는 환경변수로 임시 사본을 가리켜 원본 데이터를 건드리지 않는다.
+EXCEL_PATH    = os.environ.get("WORDLOOP_EXCEL_PATH", os.path.join(BASE_DIR, "Word.xlsx"))
+PROGRESS_PATH = os.environ.get("WORDLOOP_PROGRESS_PATH", os.path.join(BASE_DIR, "progress.json"))
 
 SHEET_NAME = "영어 단어장"
-GEMINI_MODEL = "gemini-3.6-flash"
+
+# 저장소: Supabase 설정 시 로그인(미로그인이면 로그인 화면에서 멈춤), 아니면 로컬 SQLite
+store = account.init()
+DB_MODE = store.kind == "supabase"
 
 # ============================================================
 # 데이터 로드 / 저장
@@ -158,30 +169,43 @@ def load_words(mtime: float = 0):
     G열('오답 체크')·H열('중복 체크')은 수식이므로 캐시된 계산값을 들고
     다니지 않는다 — 저장 시 행 번호 기준으로 다시 생성한다.
     """
-    wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
-    ws = wb[SHEET_NAME]
-    result = []
-    auto_no = 1  # 번호 열이 비어 있을 때 자동 부여용
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
-        if not row[1]:
-            continue
-        # 번호(col 1)가 없으면 자동 부여
-        no_val = row[0] if row[0] else auto_no
-        result.append({
-            "no":       no_val,
-            "word":     str(row[1]).strip(),
-            "meaning":  str(row[2]).strip() if row[2] else "",
-            "example":  str(row[3]).strip() if row[3] else "",
-            "category": str(row[8]).strip() if len(row) > 8 and row[8] else "기타",
-            "ai_example": str(row[9]).strip() if len(row) > 9 and row[9] else "",
-            "_extra":   list(row[4:6]),   # 열 5~6(암기 체크, 입력 날짜)만 보존
-        })
-        auto_no = int(no_val) + 1
+    result = migrate.read_excel_words(EXCEL_PATH)
+    for w in result:
+        # ponytail: 로컬 모드 word_id는 번호 기반. 마지막 번호를 지우고 다시 추가하면 이전 복습 기록이 이어짐.
+        w["id"] = migrate.word_uuid("local", w["no"])
     return result
 
 
+def load_words_db():
+    """로그인 사용자 소유 단어(번호가 겹치지 않도록 공용 단어는 기존 화면에서 제외)."""
+    if "wl_vocab" not in st.session_state:
+        rows = [r for r in store.list_vocabulary() if r.get("owner_user_id") == store.user_id]
+        st.session_state.wl_vocab = migrate.words_from_rows(rows)
+    return st.session_state.wl_vocab
+
+
+def save_words_to_db(word_list):
+    """변경된 단어만 upsert, 사라진 단어는 delete. 실패하면 저장됐다고 표시하지 않고 멈춘다."""
+    current = {w["no"]: w for w in st.session_state.wl_vocab}
+    fields = ("word", "meaning", "example", "category", "ai_example")
+    changed = [w for w in word_list
+               if w["no"] not in current or any(w.get(f, "") != current[w["no"]].get(f, "") for f in fields)]
+    removed = [current[no]["id"] for no in current.keys() - {w["no"] for w in word_list}]
+
+    def write():
+        store.upsert_vocabulary(migrate.vocabulary_rows(changed, store.user_id))
+        store.delete_vocabulary(removed)
+    account.save_with_status("단어장", write)
+    if st.session_state.wl_sync["state"] == "failed":
+        st.error("단어를 저장하지 못했습니다(동기화 실패). 네트워크를 확인한 뒤 다시 시도하세요.")
+        st.stop()
+    st.session_state.pop("wl_vocab", None)
+
+
 def save_words_to_excel(word_list):
-    """word_list를 Excel 파일에 저장하고 캐시를 초기화."""
+    """word_list를 Excel 파일에 저장하고 캐시를 초기화. (로그인 모드에서는 DB에 저장)"""
+    if DB_MODE:
+        return save_words_to_db(word_list)
     wb = openpyxl.load_workbook(EXCEL_PATH)
     ws = wb[SHEET_NAME]
 
@@ -229,29 +253,31 @@ def save_progress():
         "correct":   list(st.session_state.correct_words),
         "sessions":  st.session_state.sessions,
     }
+    if DB_MODE:
+        # 계정 DB가 정본. 공유 서버 파일·브라우저 저장소에 개인 기록을 남기지 않는다.
+        account.save_with_status("학습 진도", store.save_legacy_state, data)
+        return
     # 로컬 파일 저장 (PC 로컬 실행 시)
     try:
         with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    # 브라우저 localStorage 저장 (클라우드/모바일 지속성)
-    _save_to_localstorage(data)
+    # 브라우저 localStorage 저장은 앱 맨 끝에서 매 실행 현재 상태로 기록(_sync_browser_progress)
 
 
-def _save_to_localstorage(data: dict):
-    """base64로 인코딩해 localStorage에 저장 (특수문자 이슈 방지)."""
-    raw  = json.dumps(data, ensure_ascii=False)
-    b64  = base64.b64encode(raw.encode()).decode()
-    components.html(f"""
-    <script>
-    (function() {{
-        try {{
-            localStorage.setItem('{LS_KEY}', atob('{b64}'));
-        }} catch(e) {{ console.warn('localStorage write failed', e); }}
-    }})();
-    </script>
-    """, height=0, width=0)
+def _sync_browser_progress():
+    """로컬 모드: 현재 진도를 이 브라우저 localStorage에 기록(클라우드/모바일 지속성).
+    저장된 값을 먼저 읽어 적용한 뒤에만 쓴다 → 빈 진도로 기존 기록을 덮어쓰지 않음."""
+    if DB_MODE or not st.session_state.get("_ls_applied"):
+        return
+    data = {
+        "memorized": list(st.session_state.memorized),
+        "wrong":     list(st.session_state.wrong),
+        "correct":   list(st.session_state.correct_words),
+        "sessions":  st.session_state.sessions,
+    }
+    local_storage(LS_KEY, key="ls_progress_write", write=json.dumps(data, ensure_ascii=False), report=False)
 
 
 # ============================================================
@@ -303,227 +329,24 @@ def mark_wrong(no):
     st.session_state.correct_words.discard(no)
 
 
-def tts_button(word: str, key: str = "tts"):
-    safe = word.replace("'", "\\'").replace('"', '\\"')
-    components.html(f"""
-    <button onclick="speak()" title="{safe} 발음 듣기" style="
-        background:#1565C0;color:white;border:none;border-radius:10px;
-        padding:10px 20px;font-size:1.1rem;cursor:pointer;
-        display:flex;align-items:center;gap:6px;margin:4px auto;
-        min-height:48px;touch-action:manipulation;">
-        🔊 발음 듣기
-    </button>
-    <script>
-    function speak() {{
-        window.speechSynthesis.cancel();
-        var u = new SpeechSynthesisUtterance("{safe}");
-        u.lang = "en-US";
-        u.rate = 0.85;
-        window.speechSynthesis.speak(u);
-    }}
-    </script>
-    """, height=52)
+# ── AI: 모든 Gemini 호출은 services/ai.py(AIService)를 거친다 (캐시·일일 상한·재시도·검증) ──
+ai = ai_ui.get_ai(store)
 
 
-@st.cache_resource
-def get_gemini_client():
-    """API 키가 없거나 SDK를 불러올 수 없으면 None을 반환한다."""
-    try:
-        key = st.secrets.get("GEMINI_API_KEY")
-    except Exception:
-        key = None
-    if not key:
-        return None
-    try:
-        from google import genai
-        return genai.Client(api_key=key)
-    except Exception:
-        return None
-
-
-def gemini_text(prompt: str, *, image_bytes: bytes | None = None) -> str:
-    """Gemini 텍스트/이미지 요청의 공통 진입점."""
-    client = get_gemini_client()
-    if client is None:
-        raise RuntimeError("Gemini API가 설정되지 않았습니다.")
-
-    contents = [prompt]
-    if image_bytes is not None:
-        from google.genai import types
-        contents = [types.Part.from_bytes(data=image_bytes, mime_type="image/png"), prompt]
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-    )
-    return (response.text or "").strip()
-
-
-def parse_json_response(text: str) -> dict:
-    """마크다운 코드 펜스가 섞인 응답도 JSON으로 복구한다."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned,
-                         flags=re.IGNORECASE | re.DOTALL).strip()
-    return json.loads(cleaned)
-
-
-def generate_ai_example(word: str, meaning: str, category: str) -> str:
-    prompt = f"""당신은 한국인 영어 학습자를 위한 콘텐츠 작성자입니다. 주어진 단어로 자연스럽고 실용적인 예문 1개를 만드세요. 초중급 학습자가 이해할 수 있는 난이도로 단어가 문장에서 자연스럽게 쓰이도록 하세요. 아래 형식으로만 출력하세요.
-EN: (영어 예문)
-KO: (한국어 해석)
-
-단어: {word}
-뜻: {meaning}
-카테고리: {category}"""
-    return gemini_text(prompt)
-
-
-def generate_ai_toeic_questions(question_words, word_bank):
-    """Excel 단어를 바탕으로 AI 토익형 4지선다 문제를 일괄 생성한다."""
-    targets = [
-        {"no": w["no"], "word": w["word"], "meaning": w["meaning"]}
-        for w in question_words
-    ]
-    bank = [w["word"] for w in word_bank]
-    prompt = f"""당신은 한국인 학습자를 위한 TOEIC 영단어 출제자입니다.
-아래 목표 단어마다 비즈니스·사무·여행·일상 상황의 자연스러운 영어 빈칸 문장 1개와 4지선다 선택지를 만드세요.
-
-규칙:
-1. 문장에는 정답 단어가 들어갈 자리를 정확히 `_____`로 표시합니다.
-2. correct는 목표 단어와 철자 및 형태가 정확히 같아야 합니다.
-3. choices는 correct 1개와 오답 3개로 구성하고, 오답은 반드시 선택지 후보 단어에서 고릅니다.
-4. 선택지는 중복 없이 정확히 4개입니다.
-5. 문맥만으로 답을 고를 수 있게 작성하고 목표 단어 자체를 문장 다른 부분에 노출하지 않습니다.
-6. translation은 정답을 넣은 완성 문장의 자연스러운 한국어 해석입니다.
-7. explanation은 정답 근거를 한국어 한 문장으로 설명합니다.
-8. 반드시 아래 JSON 형식으로만 답합니다.
-
-{{"questions":[{{"no":1,"sentence":"... _____ ...","choices":["a","b","c","d"],"correct":"...","translation":"...","explanation":"..."}}]}}
-
-목표 단어:
-{json.dumps(targets, ensure_ascii=False)}
-
-선택지 후보 단어:
-{json.dumps(bank, ensure_ascii=False)}"""
-    data = parse_json_response(gemini_text(prompt))
-    generated = data.get("questions", [])
-    by_no = {}
-    for item in generated:
-        try:
-            by_no[int(item.get("no"))] = item
-        except (TypeError, ValueError):
-            continue
-
-    allowed = list(dict.fromkeys(bank))
+def ai_toeic_with_fallback(questions, word_bank):
+    """AI 문제를 만들고, 검증에 실패한 단어는 로컬 문제(예문 빈칸 → 4지선다)로 채운다."""
+    targets = [{"no": w["no"], "word": w["word"], "meaning": w["meaning"]} for w in questions]
+    generated = ai.toeic_questions(targets, [w["word"] for w in word_bank])
     result = {}
-    for target in question_words:
-        item = by_no.get(int(target["no"]))
-        if not item:
-            raise ValueError(f"{target['word']} 문제 생성 결과가 없습니다.")
+    for q in questions:
+        item = generated.get(q["no"]) or make_toeic_question(q, words)
+        if item is None:
+            opts, _ = make_choices(q, "뜻 → 영어", words)
+            item = {"sentence": f"‘{q['meaning']}’에 해당하는 단어는 {ai_mod.BLANK} 입니다.",
+                    "choices": opts, "correct": q["word"]}
+        result[q["no"]] = item
+    return result, len(generated)
 
-        sentence = str(item.get("sentence", "")).strip()
-        if "_____" not in sentence:
-            pattern = re.compile(re.escape(target["word"]), re.IGNORECASE)
-            sentence = pattern.sub("_____", sentence, count=1)
-        if "_____" not in sentence:
-            raise ValueError(f"{target['word']} 문제에 빈칸이 없습니다.")
-
-        choices = [str(c).strip() for c in item.get("choices", []) if str(c).strip()]
-        choices = list(dict.fromkeys(choices))
-        choices = [c for c in choices if c.lower() != target["word"].lower()]
-        valid_distractors = [
-            c for c in choices
-            if any(c.lower() == candidate.lower() for candidate in allowed)
-        ]
-        fallback = [
-            candidate for candidate in allowed
-            if candidate.lower() != target["word"].lower()
-            and all(candidate.lower() != c.lower() for c in valid_distractors)
-        ]
-        random.shuffle(fallback)
-        final_choices = valid_distractors[:3] + fallback[:max(0, 3 - len(valid_distractors))]
-        if len(final_choices) < 3:
-            raise ValueError("4지선다 선택지를 구성할 단어가 부족합니다.")
-        final_choices.append(target["word"])
-        random.shuffle(final_choices)
-
-        result[target["no"]] = {
-            "sentence": sentence,
-            "choices": final_choices,
-            "correct": target["word"],
-            "translation": str(item.get("translation", "")).strip(),
-            "explanation": str(item.get("explanation", "")).strip(),
-            "ai_generated": True,
-        }
-    return result
-
-
-def writing_canvas(word: str, mode: str, canvas_key: str):
-    """마우스와 터치를 모두 지원하는 손글씨 캔버스."""
-    guide = word if mode == "따라쓰기" else ""
-    safe_guide = json.dumps(guide, ensure_ascii=False)
-    storage_key = json.dumps(f"ew_canvas_{word}_{mode}", ensure_ascii=False)
-    components.html(f"""
-    <div class="canvas-wrap">
-      <canvas id="{canvas_key}" width="640" height="360"></canvas>
-      <button type="button" id="clear-{canvas_key}">🧹 지우기</button>
-    </div>
-    <style>
-      html,body {{ margin:0; padding:0; background:transparent; }}
-      .canvas-wrap {{ position:relative; width:100%; }}
-      canvas {{ width:100%; max-width:640px; height:auto; aspect-ratio:16/9;
-        border:2px solid #9fa8da; border-radius:14px; background:#fff;
-        display:block; margin:0 auto; touch-action:none; box-sizing:border-box; }}
-      button {{ display:block; margin:8px auto 0; min-height:44px; padding:8px 20px;
-        border:0; border-radius:10px; background:#546e7a; color:white;
-        font-size:16px; font-weight:700; cursor:pointer; }}
-    </style>
-    <script>
-    (() => {{
-      const canvas = document.getElementById('{canvas_key}');
-      const ctx = canvas.getContext('2d');
-      const guide = {safe_guide};
-      const storageKey = {storage_key};
-      let drawing = false;
-      function reset(clearSaved=true) {{
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-        canvas.dataset.empty = 'true';
-        if (clearSaved) sessionStorage.removeItem(storageKey);
-      }}
-      function point(e) {{
-        const r = canvas.getBoundingClientRect();
-        return {{x:(e.clientX-r.left)*canvas.width/r.width,
-                 y:(e.clientY-r.top)*canvas.height/r.height}};
-      }}
-      function start(e) {{ e.preventDefault(); drawing=true; const p=point(e);
-        ctx.beginPath(); ctx.moveTo(p.x,p.y); canvas.dataset.empty='false'; }}
-      function move(e) {{ if(!drawing) return; e.preventDefault(); const p=point(e);
-        ctx.lineWidth=7; ctx.lineCap='round'; ctx.lineJoin='round'; ctx.strokeStyle='#18212b';
-        ctx.lineTo(p.x,p.y); ctx.stroke(); }}
-      function end(e) {{ if(e) e.preventDefault();
-        if (drawing) sessionStorage.setItem(storageKey, canvas.toDataURL('image/png'));
-        drawing=false; ctx.closePath(); }}
-      reset(false);
-      const saved = sessionStorage.getItem(storageKey);
-      if (saved) {{ const img = new Image(); img.onload=()=>{{ctx.drawImage(img,0,0);canvas.dataset.empty='false';}}; img.src=saved; }}
-      if (guide) {{
-        const overlay = document.createElement('div');
-        overlay.textContent = guide;
-        overlay.style.cssText = 'position:absolute;inset:0 0 52px 0;display:flex;align-items:center;justify-content:center;pointer-events:none;color:rgba(0,0,0,.15);font:700 clamp(48px,14vw,110px) sans-serif;overflow:hidden';
-        canvas.parentElement.appendChild(overlay);
-      }}
-      canvas.addEventListener('pointerdown', start);
-      canvas.addEventListener('pointermove', move);
-      canvas.addEventListener('pointerup', end);
-      canvas.addEventListener('pointerleave', end);
-      canvas.addEventListener('touchstart', e=>e.preventDefault(), {{passive:false}});
-      canvas.addEventListener('touchmove', e=>e.preventDefault(), {{passive:false}});
-      canvas.addEventListener('touchend', e=>e.preventDefault(), {{passive:false}});
-      document.getElementById('clear-{canvas_key}').addEventListener('click', reset);
-    }})();
-    </script>
-    """, height=430)
 
 
 def make_excel_bytes(word_list, extra_cols=None):
@@ -583,7 +406,8 @@ def start_ai_toeic_test(pool, n):
     bank_size = min(80, len(distractor_pool))
     bank_words = random.sample(distractor_pool, bank_size) if bank_size else []
     word_bank = questions + bank_words
-    ai_data = generate_ai_toeic_questions(questions, word_bank)
+    ai_data, ai_count = ai_toeic_with_fallback(questions, word_bank)
+    st.session_state.test_ai_count = ai_count
     st.session_state.update({
         "test_questions": questions,
         "test_options": {},
@@ -630,20 +454,29 @@ def pick_next_inf():
 # ============================================================
 # 세션 초기화
 # ============================================================
-_excel_mtime   = os.path.getmtime(EXCEL_PATH) if os.path.exists(EXCEL_PATH) else 0
-words          = load_words(_excel_mtime)
+if DB_MODE:
+    words = load_words_db()
+    if not words:
+        # 첫 로그인: 원본 단어장을 이 계정으로 가져와야 학습을 시작할 수 있다.
+        from views import data_tools
+        data_tools.first_run_import(store, EXCEL_PATH, PROGRESS_PATH)
+        st.stop()
+else:
+    _excel_mtime = os.path.getmtime(EXCEL_PATH) if os.path.exists(EXCEL_PATH) else 0
+    words        = load_words(_excel_mtime)
 all_categories = sorted(set(w["category"] for w in words))
 
 # localStorage 값 요청 (첫 렌더: None 반환 → 자동 rerun → 두 번째 렌더: 실제 값)
 _ls_raw = streamlit_js_eval(
-    js_expressions=f"localStorage.getItem('{LS_KEY}')",
+    # 값이 없으면 '' (None이면 '아직 못 읽음'과 구분이 안 돼 이 브라우저에 진도를 한 번도 저장하지 못함)
+    js_expressions=f"localStorage.getItem('{LS_KEY}') || ''",
     want_output=True,
     key="ls_init",
 )
 
 if "initialized" not in st.session_state:
-    # 일단 파일 기반으로 초기화 (로컬 실행 대응)
-    p = load_progress()
+    # 로그인 모드는 계정 DB, 로컬 모드는 파일 기반으로 초기화
+    p = (store.get_profile() or {}).get("legacy_state") or {} if DB_MODE else load_progress()
     st.session_state.memorized     = set(p.get("memorized", []))
     st.session_state.wrong         = set(p.get("wrong", []))
     st.session_state.correct_words = set(p.get("correct", []))
@@ -652,6 +485,9 @@ if "initialized" not in st.session_state:
     st.session_state._ls_applied   = False
 
 # localStorage 값이 도착하면 덮어쓰기 (클라우드 환경에서 진도 복원)
+# 로그인 모드는 자동 덮어쓰기 대신 '미리보기 → 병합' 화면에서 사용자가 고른다.
+if DB_MODE:
+    st.session_state._ls_applied = True
 if not st.session_state.get("_ls_applied") and _ls_raw is not None:
     if _ls_raw and _ls_raw not in ("null", "undefined", ""):
         try:
@@ -716,9 +552,34 @@ c4.metric("❌ 오답",   f"{len(st.session_state.wrong)}개")
 
 st.divider()
 
-tab_study, tab_write, tab_test, tab_inf, tab_wordbook, tab_mgmt, tab_stats = st.tabs(
-    ["📖 학습", "✍️ 쓰기 연습", "📝 시험", "♾️ 무한", "📋 단어장", "✏️ 단어 관리", "📊 통계"]
+account.sidebar(store, ai_ui.status_text(ai))
+if DB_MODE:
+    from views import data_tools
+    data_tools.legacy_panel(store, PROGRESS_PATH, _ls_raw, {w["no"] for w in words})
+
+TAB_LABELS = ["🏠 오늘", "📖 학습", "✍️ 쓰기 연습", "📝 시험", "♾️ 무한", "📋 단어장", "✏️ 단어 관리", "📊 통계"]
+TAB_ALIASES = dict(zip(["today", "study", "write", "test", "inf", "words", "manage", "stats"], TAB_LABELS))
+# ?tab=write 처럼 시작 탭 지정 (갤럭시탭 홈 화면 바로가기를 S펜 쓰기 연습으로 만들 때)
+tab_today, tab_study, tab_write, tab_test, tab_inf, tab_wordbook, tab_mgmt, tab_stats = st.tabs(
+    TAB_LABELS, default=TAB_ALIASES.get(st.query_params.get("tab"))
 )
+
+
+def legacy_result(no, correct):
+    """새 복습(FSRS) 결과를 기존 화면(단어장·통계)의 정답/오답 표시에도 반영."""
+    (mark_correct if correct else mark_wrong)(no)
+    if correct:
+        st.session_state.memorized.add(no)
+    save_progress()
+
+
+# ============================================================
+# TAB 0 — 오늘 (FSRS 복습)
+# ============================================================
+with tab_today:
+    from views import today
+    today.render(store=store, ai=ai, words=words, on_legacy_result=legacy_result,
+                 legacy_wrong=set(st.session_state.wrong))
 
 
 # ============================================================
@@ -763,7 +624,7 @@ with tab_study:
 
         with st.container(border=True):
             front = card["word"] if study_dir == "영어 → 뜻" else card["meaning"]
-            st.markdown(f"<div class='card-front'>{front}</div>",
+            st.markdown(f"<div class='card-front'>{html.escape(front)}</div>",
                         unsafe_allow_html=True)
             tts_button(card["word"], key=f"tts_card_{idx}")
             badge = ("🎯 정답 맞춤" if is_correct else "") + \
@@ -774,7 +635,7 @@ with tab_study:
             if st.session_state.card_revealed:
                 st.divider()
                 back = card["meaning"] if study_dir == "영어 → 뜻" else card["word"]
-                st.markdown(f"<div class='card-back'>{back}</div>",
+                st.markdown(f"<div class='card-back'>{html.escape(back)}</div>",
                             unsafe_allow_html=True)
                 if card["example"]:
                     with st.expander("📖 예문"):
@@ -826,161 +687,10 @@ with tab_study:
 # TAB 2 — 쓰기 연습
 # ============================================================
 with tab_write:
-    st.subheader("✍️ 쓰기 연습")
-
-    write_cats = st.multiselect("카테고리", all_categories,
-                                default=all_categories, key="write_cats")
-    wc1, wc2, wc3 = st.columns(3)
-    with wc1:
-        write_dir = st.radio("방향", ["영어 → 뜻", "뜻 → 영어"],
-                             horizontal=True, key="write_dir")
-    with wc2:
-        write_scope = st.radio("범위", ["전체", "미암기만", "오답만", "정답 맞춘"],
-                               horizontal=True, key="write_scope")
-    with wc3:
-        write_mode = st.radio("모드", ["따라쓰기", "생각해 쓰기"],
-                              horizontal=True, key="write_mode")
-
-    write_filtered = filter_words(words, write_cats, write_scope)
-    if not write_filtered:
-        st.info("연습할 단어가 없어요. 필터를 조정해보세요.")
-    else:
-        write_sig = (tuple(sorted(write_cats)), write_scope)
-        if st.session_state.write_filter_sig != write_sig:
-            st.session_state.write_list = write_filtered.copy()
-            random.shuffle(st.session_state.write_list)
-            st.session_state.write_idx = 0
-            st.session_state.write_revealed = False
-            st.session_state.write_ai_grading = None
-            st.session_state.write_filter_sig = write_sig
-
-        write_list = st.session_state.write_list
-        write_idx = min(st.session_state.write_idx, len(write_list) - 1)
-        st.session_state.write_idx = write_idx
-        write_card = write_list[write_idx]
-        st.progress((write_idx + 1) / len(write_list),
-                    text=f"{write_idx + 1} / {len(write_list)}")
-
-        prompt_text = (write_card["word"] if write_dir == "영어 → 뜻"
-                       else write_card["meaning"])
-        with st.container(border=True):
-            st.markdown(f"<div class='card-front'>{prompt_text}</div>",
-                        unsafe_allow_html=True)
-            st.caption(f"카테고리: {write_card['category']}  No.{write_card['no']}")
-            if write_dir == "영어 → 뜻":
-                tts_button(write_card["word"], key=f"tts_write_{write_idx}")
-
-            writing_canvas(write_card["word"], write_mode, "writeCanvas")
-
-            if st.session_state.write_revealed:
-                answer = (write_card["meaning"] if write_dir == "영어 → 뜻"
-                          else write_card["word"])
-                st.markdown(f"<div class='card-back'>{answer}</div>",
-                            unsafe_allow_html=True)
-                shown_example = write_card["example"] or write_card.get("ai_example", "")
-                if shown_example:
-                    label = "✨ AI 생성 예문" if not write_card["example"] else "📖 예문"
-                    with st.expander(label):
-                        st.write(shown_example)
-
-        canvas_data = streamlit_js_eval(
-            js_expressions="""(() => {
-              for (const frame of document.querySelectorAll('iframe')) {
-                try {
-                  const c = frame.contentDocument && frame.contentDocument.getElementById('writeCanvas');
-                  if (c) return c.dataset.empty === 'true' ? '' : c.toDataURL('image/png');
-                } catch (e) {}
-              }
-              return null;
-            })()""",
-            want_output=True,
-            key=(f"write_canvas_data_{write_card['no']}_{write_mode}_"
-                 f"{st.session_state.write_capture_nonce}"),
-        )
-
-        if st.session_state.write_ai_pending and canvas_data is not None:
-            st.session_state.write_ai_pending = False
-            if not canvas_data:
-                st.warning("먼저 캔버스에 단어를 써주세요.")
-            else:
-                try:
-                    encoded = canvas_data.split(",", 1)[1]
-                    image_bytes = base64.b64decode(encoded)
-                    prompt = f"""당신은 영어 스펠링 코치입니다. 사용자가 캔버스에 손으로 쓴 영단어 이미지를 보고 목표 단어와 실제로 쓴 철자를 비교해 정답 여부를 판정합니다. 반드시 아래 JSON 형식으로만 답하세요.
-{{"is_correct": true, "written_guess": "인식한 철자", "feedback": "한국어로 15자 이내 피드백"}}
-
-목표 단어: {write_card['word']}
-뜻: {write_card['meaning']}"""
-                    raw = gemini_text(prompt, image_bytes=image_bytes)
-                    result = parse_json_response(raw)
-                    st.session_state.write_ai_grading = result
-                    if result.get("is_correct"):
-                        mark_correct(write_card["no"])
-                        st.session_state.memorized.add(write_card["no"])
-                    else:
-                        mark_wrong(write_card["no"])
-                    save_progress()
-                except json.JSONDecodeError:
-                    st.warning("AI 응답을 채점 형식으로 읽지 못했습니다.")
-                    st.write(raw)
-                except Exception:
-                    st.warning("AI 응답을 가져오지 못했습니다. 잠시 후 다시 시도하세요.")
-
-        nav1, nav2, nav3 = st.columns(3)
-        with nav1:
-            if st.button("⬅️ 이전", key="write_prev", use_container_width=True):
-                st.session_state.write_idx = max(0, write_idx - 1)
-                st.session_state.write_revealed = False
-                st.session_state.write_ai_grading = None
-                st.rerun()
-        with nav2:
-            if st.button("🔍 정답 보기", key="write_reveal", type="primary",
-                         use_container_width=True,
-                         disabled=st.session_state.write_revealed):
-                st.session_state.write_revealed = True
-                st.rerun()
-        with nav3:
-            if st.button("➡️ 다음", key="write_next", use_container_width=True):
-                st.session_state.write_idx = min(len(write_list) - 1, write_idx + 1)
-                st.session_state.write_revealed = False
-                st.session_state.write_ai_grading = None
-                st.rerun()
-
-        grade1, grade2 = st.columns(2)
-        with grade1:
-            if st.button("✅ 잘 썼어요", key="write_correct", use_container_width=True):
-                mark_correct(write_card["no"])
-                st.session_state.memorized.add(write_card["no"])
-                save_progress()
-                st.success("정답으로 기록했어요.")
-        with grade2:
-            if st.button("🔁 다시 연습", key="write_wrong", use_container_width=True):
-                mark_wrong(write_card["no"])
-                save_progress()
-                st.info("오답 복습 목록에 추가했어요.")
-
-        ai_client = get_gemini_client()
-        if ai_client is not None:
-            if st.button("✨ AI로 채점하기", key="write_ai_grade",
-                         use_container_width=True):
-                st.session_state.write_ai_pending = True
-                st.session_state.write_capture_nonce += 1
-                st.rerun()
-
-        ai_grade = st.session_state.write_ai_grading
-        if ai_grade:
-            message = f"{ai_grade.get('feedback', '')} (인식: {ai_grade.get('written_guess', '-')})"
-            if ai_grade.get("is_correct"):
-                st.success(message)
-            else:
-                st.error(message)
-
-        if st.button("🔀 섞기", key="write_shuffle", use_container_width=True):
-            random.shuffle(st.session_state.write_list)
-            st.session_state.write_idx = 0
-            st.session_state.write_revealed = False
-            st.session_state.write_ai_grading = None
-            st.rerun()
+    from views import handwriting
+    handwriting.render(store=store, ai=ai, words=words, all_categories=all_categories,
+                       filter_words=filter_words, tts_button=tts_button, on_legacy_result=legacy_result,
+                       legacy_wrong=set(st.session_state.wrong))
 
 
 # ============================================================
@@ -998,7 +708,7 @@ with tab_test:
             t_scope = st.radio("범위", ["전체", "미암기만", "오답만", "정답 맞춘"], key="t_scope")
         with tc2:
             test_modes = ["4지선다", "주관식", "토익식 빈칸"]
-            if get_gemini_client() is not None:
+            if ai.enabled:
                 test_modes.append("✨ AI 토익 4지선다")
             t_mode = st.radio("유형", test_modes, key="t_mode")
         with tc3:
@@ -1026,9 +736,8 @@ with tab_test:
                         with st.spinner(f"AI가 토익형 문제 {n_q}개를 만들고 있어요..."):
                             start_ai_toeic_test(pool, n_q)
                         st.rerun()
-                    except Exception as exc:
-                        st.warning("AI 문제를 만들지 못했습니다. 잠시 후 다시 시도하세요.")
-                        st.caption(str(exc))
+                    except AIError as exc:
+                        st.warning(exc.user_message + " 대신 일반 '토익식 빈칸'이나 4지선다로 시험을 볼 수 있어요.")
                 else:
                     start_regular_test(pool, n_q, t_mode, t_dir)
                     st.rerun()
@@ -1051,7 +760,7 @@ with tab_test:
                     st.markdown(
                         f"<div class='q-label'><span class='q-num'>Q{i+1}</span> 빈칸에 알맞은 단어를 고르세요.</div>",
                         unsafe_allow_html=True)
-                    st.markdown(f"<div class='toeic-sentence'>{td['sentence']}</div>",
+                    st.markdown(f"<div class='toeic-sentence'>{html.escape(td['sentence'])}</div>",
                                 unsafe_allow_html=True)
                     st.radio("", td["choices"], index=None,
                              label_visibility="collapsed", key=f"test_q_{i}")
@@ -1059,7 +768,7 @@ with tab_test:
                 elif mode in ("토익식 빈칸", "AI 토익 4지선다") and not td:
                     opts = st.session_state.test_options.get(q["no"], [])
                     st.markdown(
-                        f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{q['word']}</code> 의 뜻은?</div>",
+                        f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{html.escape(q['word'])}</code> 의 뜻은?</div>",
                         unsafe_allow_html=True)
                     st.radio("", opts, index=None,
                              label_visibility="collapsed", key=f"test_q_{i}")
@@ -1068,11 +777,11 @@ with tab_test:
                     opts = st.session_state.test_options.get(q["no"], [])
                     if direction == "영어 → 뜻":
                         st.markdown(
-                            f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{q['word']}</code> 의 뜻은?</div>",
+                            f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{html.escape(q['word'])}</code> 의 뜻은?</div>",
                             unsafe_allow_html=True)
                     else:
                         st.markdown(
-                            f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{q['meaning']}</code> 에 해당하는 영단어는?</div>",
+                            f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{html.escape(q['meaning'])}</code> 에 해당하는 영단어는?</div>",
                             unsafe_allow_html=True)
                     st.radio("", opts, index=None,
                              label_visibility="collapsed", key=f"test_q_{i}")
@@ -1080,11 +789,11 @@ with tab_test:
                 else:  # 주관식
                     if direction == "영어 → 뜻":
                         st.markdown(
-                            f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{q['word']}</code> 의 뜻은?</div>",
+                            f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{html.escape(q['word'])}</code> 의 뜻은?</div>",
                             unsafe_allow_html=True)
                     else:
                         st.markdown(
-                            f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{q['meaning']}</code> 에 해당하는 영단어는?</div>",
+                            f"<div class='q-label'><span class='q-num'>Q{i+1}</span> <code>{html.escape(q['meaning'])}</code> 에 해당하는 영단어는?</div>",
                             unsafe_allow_html=True)
                     st.text_input("", placeholder="정답 입력",
                                   label_visibility="collapsed", key=f"test_q_{i}")
@@ -1119,7 +828,9 @@ with tab_test:
                                  "correct_ans": correct_ans, "is_correct": is_ok,
                                  "toeic_sentence": td["sentence"] if td else None,
                                  "translation": td.get("translation", "") if td else "",
-                                 "explanation": td.get("explanation", "") if td else ""})
+                                 "explanation": td.get("explanation", "") if td else "",
+                                 "ai_generated": bool(td and td.get("ai_generated")),
+                                 "cache_key": td.get("cache_key") if td else None})
 
             correct_count = sum(1 for r in results if r["is_correct"])
             score = correct_count / len(results) * 100
@@ -1130,6 +841,9 @@ with tab_test:
                 "score": round(score, 1), "mode": mode, "direction": direction,
             }
             st.session_state.sessions.append(session)
+            account.submit(store, "시험 기록", sync.test_session_item({
+                "session_id": uuid.uuid4(), "mode": mode, "total": len(results),
+                "correct": correct_count, "finished_at": utcnow()}))
             st.session_state.test_result = {
                 "results": results, "score": score, "correct_count": correct_count,
             }
@@ -1162,14 +876,26 @@ with tab_test:
 
         if result_mode == "AI 토익 4지선다":
             with st.expander("✨ AI 토익 문제 해설", expanded=True):
+                st.caption("✨ 표시는 AI가 만든 문제입니다. 문장·정답이 어색하면 🚩로 신고하면 다음부터 새 문제로 바뀝니다. "
+                           f"(AI 문제 {st.session_state.get('test_ai_count', 0)}개 · 나머지는 예문 기반 대체 문제)")
                 for i, r in enumerate(results, start=1):
                     icon = "✅" if r["is_correct"] else "❌"
-                    st.markdown(f"**{icon} Q{i}. {r['toeic_sentence']}**")
+                    mark = "✨ " if r.get("ai_generated") else ""
+                    st.markdown(f"**{icon} Q{i}. {mark}{r['toeic_sentence']}**")
                     st.write(f"정답: **{r['correct_ans']}**")
                     if r.get("translation"):
                         st.caption(f"해석: {r['translation']}")
                     if r.get("explanation"):
                         st.caption(f"해설: {r['explanation']}")
+                    if r.get("cache_key"):
+                        reported = r["cache_key"] in st.session_state.setdefault("ai_reported", set())
+                        if st.button("🚩 이 문제 신고 · 다음에 새로 만들기", key=f"report_q_{i}",
+                                     disabled=reported):
+                            ai.report_bad("toeic", r["cache_key"])
+                            st.session_state.ai_reported.add(r["cache_key"])
+                            st.rerun()
+                        if reported:
+                            st.caption("신고됨 — 이 단어는 다음 AI 시험에서 새 문제로 만듭니다.")
                     st.divider()
 
         correct_rs = [r for r in results if r["is_correct"]]
@@ -1297,11 +1023,11 @@ with tab_inf:
 
         if mode == "토익식 빈칸" and td:
             st.markdown("**빈칸에 알맞은 단어를 고르세요.**")
-            st.markdown(f"<div class='toeic-sentence'>{td['sentence']}</div>",
+            st.markdown(f"<div class='toeic-sentence'>{html.escape(td['sentence'])}</div>",
                         unsafe_allow_html=True)
         else:
             front = q["word"] if direction == "영어 → 뜻" else q["meaning"]
-            st.markdown(f"<div class='inf-question'>{front}</div>",
+            st.markdown(f"<div class='inf-question'>{html.escape(front)}</div>",
                         unsafe_allow_html=True)
         tts_button(q["word"], key=f"tts_inf_{s_tot}")
         st.caption(f"카테고리: {q['category']}  No.{q['no']}")
@@ -1351,7 +1077,7 @@ with tab_inf:
                     st.error(f"❌ {choice}  ← 내 선택")
                 else:
                     st.markdown(
-                        f"<div style='padding:6px 12px;color:#888'>○ {choice}</div>",
+                        f"<div style='padding:6px 12px;color:#888'>○ {html.escape(choice)}</div>",
                         unsafe_allow_html=True)
 
             if is_ok:
@@ -1463,16 +1189,11 @@ with tab_mgmt:
         st.markdown("#### 새 단어 추가")
         new_word = st.text_input("영어 단어 *", placeholder="예: inevitable",
                                  key="add_word_input")
-        if get_gemini_client() is not None:
+        if ai.enabled:
             if st.button("✨ AI로 자동완성", use_container_width=True,
                          disabled=not new_word.strip()):
                 try:
-                    prompt = f"""다음 영단어에 대한 한국어 뜻, 예문 1개, 어울리는 카테고리를 제안하세요. 카테고리는 후보 중에서 고르거나 적절한 것이 없으면 새 이름을 제안하세요. 반드시 JSON 형식으로만 답하세요.
-{{"meaning": "...", "example": "...", "category": "..."}}
-
-단어: {new_word.strip()}
-카테고리 후보: {', '.join(all_categories)}"""
-                    suggestion = parse_json_response(gemini_text(prompt))
+                    suggestion = ai.autofill(new_word.strip(), all_categories).model_dump()
                     st.session_state.add_ai_suggestion = suggestion
                     st.session_state.add_meaning_input = suggestion.get("meaning", "")
                     st.session_state.add_example_input = suggestion.get("example", "")
@@ -1482,8 +1203,8 @@ with tab_mgmt:
                     else:
                         st.session_state.add_category_choice = "직접 입력"
                         st.session_state.add_custom_category = suggested_cat
-                except Exception:
-                    st.warning("AI 응답을 가져오지 못했습니다. 잠시 후 다시 시도하세요.")
+                except AIError as exc:
+                    st.warning(exc.user_message)
 
         with st.form("add_word_form", clear_on_submit=True):
             new_meaning = st.text_input("뜻 *", placeholder="예: 불가피한, 필연적인",
@@ -1535,8 +1256,8 @@ with tab_mgmt:
                 for w in found[:20]:
                     col_info, col_btn = st.columns([4, 1])
                     with col_info:
-                        st.markdown(f"**{w['word']}** — {w['meaning']}  "
-                                    f"<small>({w['category']})</small>",
+                        st.markdown(f"**{html.escape(w['word'])}** — {html.escape(w['meaning'])}  "
+                                    f"<small>({html.escape(w['category'])})</small>",
                                     unsafe_allow_html=True)
                     with col_btn:
                         if st.button("수정", key=f"edit_btn_{w['no']}",
@@ -1552,12 +1273,14 @@ with tab_mgmt:
                 if target.get("ai_example"):
                     with st.expander("✨ 저장된 AI 생성 예문"):
                         st.write(target["ai_example"])
-                if get_gemini_client() is not None:
-                    if st.button("✨ AI 예문 생성", key=f"ai_example_{target['no']}",
+                if ai.enabled:
+                    has_ai_ex = bool(target.get("ai_example"))
+                    label = "🚩 AI 예문 신고 · 다시 만들기" if has_ai_ex else "✨ AI 예문 생성"
+                    if st.button(label, key=f"ai_example_{target['no']}",
                                  use_container_width=True):
                         try:
-                            generated = generate_ai_example(
-                                target["word"], target["meaning"], target["category"])
+                            generated = format_example(ai.example(
+                                target["word"], target["meaning"], target["category"], fresh=has_ai_ex))
                             updated_words = [
                                 {**w, "ai_example": generated} if w["no"] == target["no"] else w
                                 for w in words
@@ -1565,8 +1288,8 @@ with tab_mgmt:
                             save_words_to_excel(updated_words)
                             st.success("AI 예문을 별도 열에 저장했습니다.")
                             st.rerun()
-                        except Exception:
-                            st.warning("AI 응답을 가져오지 못했습니다. 잠시 후 다시 시도하세요.")
+                        except AIError as exc:
+                            st.warning(exc.user_message)
                 with st.form("edit_word_form"):
                     ed_word     = st.text_input("영어 단어", value=target["word"])
                     ed_meaning  = st.text_input("뜻",       value=target["meaning"])
@@ -1623,8 +1346,8 @@ with tab_mgmt:
                 for w in found[:20]:
                     col_info, col_btn = st.columns([4, 1])
                     with col_info:
-                        st.markdown(f"**{w['word']}** — {w['meaning']}  "
-                                    f"<small>({w['category']})</small>",
+                        st.markdown(f"**{html.escape(w['word'])}** — {html.escape(w['meaning'])}  "
+                                    f"<small>({html.escape(w['category'])})</small>",
                                     unsafe_allow_html=True)
                     with col_btn:
                         if st.button("삭제", key=f"del_btn_{w['no']}",
@@ -1657,37 +1380,47 @@ with tab_mgmt:
                         st.session_state.mgmt_confirm_delete = None
                         st.rerun()
 
-    if get_gemini_client() is not None:
+    st.divider()
+    from views import data_tools
+    data_tools.backup_panel(store, words, make_excel_bytes)
+
+    if ai.enabled:
         st.divider()
+        st.markdown("#### ✨ 예문 없는 단어 AI 예문 만들기")
         missing_examples = [w for w in words if not w["example"] and not w.get("ai_example")]
-        if st.button(f"✨ 예문 없는 단어 전체 AI 생성 ({len(missing_examples)}개)",
-                     key="bulk_ai_examples", use_container_width=True,
-                     disabled=not missing_examples):
-            progress = st.progress(0, text="AI 예문을 생성하고 있어요.")
-            generated_by_no = {}
-            failed = 0
-            for pos, item in enumerate(missing_examples, start=1):
-                try:
-                    generated_by_no[item["no"]] = generate_ai_example(
-                        item["word"], item["meaning"], item["category"])
-                except Exception:
-                    failed += 1
-                progress.progress(pos / len(missing_examples),
-                                  text=f"{pos} / {len(missing_examples)}")
-                if pos < len(missing_examples):
-                    time.sleep(1)
-            if generated_by_no:
-                updated_words = [
-                    {**w, "ai_example": generated_by_no[w["no"]]}
-                    if w["no"] in generated_by_no else w
-                    for w in words
-                ]
-                save_words_to_excel(updated_words)
-            if failed:
-                st.warning(f"완료: {len(generated_by_no)}개 생성, {failed}개 실패")
-            else:
-                st.success(f"{len(generated_by_no)}개 예문 생성을 완료했습니다.")
-            st.rerun()
+        left = ai.remaining_budget()
+        st.caption(f"예문 없는 단어 {len(missing_examples)}개 · 오늘 남은 AI 요청 {left}회. "
+                   "무료 한도를 지키기 위해 한 번에 최대 20개씩 만들고, 다시 누르면 남은 단어부터 이어서 만듭니다.")
+        if missing_examples and left > 0:
+            batch = st.slider("이번에 만들 개수", 1, max(1, min(20, len(missing_examples), left)),
+                              min(5, len(missing_examples), left), key="bulk_ai_batch")
+            confirm = st.checkbox(f"최대 {batch}회 Gemini 요청을 보냅니다 (단어·뜻·카테고리만 전송)",
+                                  key="bulk_ai_confirm")
+            if st.button(f"✨ {batch}개 예문 생성", key="bulk_ai_examples", use_container_width=True,
+                         disabled=not confirm):
+                progress = st.progress(0, text="AI 예문을 생성하고 있어요.")
+                generated_by_no, failed, stopped = {}, 0, None
+                for pos, item in enumerate(missing_examples[:batch], start=1):
+                    try:
+                        generated_by_no[item["no"]] = format_example(
+                            ai.example(item["word"], item["meaning"], item["category"]))
+                    except AIError as exc:
+                        failed += 1
+                        if exc.kind in ("budget", "circuit_open", "rate_limited", "disabled", "model"):
+                            stopped = exc.user_message   # 한도·연속 실패면 즉시 중단 (다음에 이어서)
+                            break
+                    progress.progress(pos / batch, text=f"{pos} / {batch}")
+                if generated_by_no:
+                    save_words_to_excel([
+                        {**w, "ai_example": generated_by_no[w["no"]]} if w["no"] in generated_by_no else w
+                        for w in words
+                    ])
+                st.session_state.bulk_ai_confirm = False
+                msg = f"{len(generated_by_no)}개 저장, 실패 {failed}개."
+                if stopped:
+                    st.warning(f"{msg} 중단됨: {stopped}")
+                else:
+                    st.success(msg)
 
 
 # ============================================================
@@ -1695,32 +1428,37 @@ with tab_mgmt:
 # ============================================================
 with tab_stats:
     st.subheader("📊 학습 통계")
+    from views import dashboard
+    dashboard.render(store=store, words=words)
+    st.divider()
 
-    if get_gemini_client() is not None:
+    if ai.enabled:
         with st.container(border=True):
-            st.markdown("#### 🌟 오늘의 학습 추천")
-            refresh_coach = st.button("🔄 다시 추천받기", key="refresh_coach")
-            if st.session_state.coach_tip is None or refresh_coach:
-                wrong_words = [w["word"] for w in words
-                               if w["no"] in st.session_state.wrong][:30]
-                recent_scores = [s.get("score", 0) for s in st.session_state.sessions[-5:]]
-                category_progress = {}
-                for cat in all_categories:
-                    cat_words = [w for w in words if w["category"] == cat]
-                    done = [w for w in cat_words if w["no"] in
-                            (st.session_state.memorized | st.session_state.correct_words)]
-                    category_progress[cat] = f"{len(done)}/{len(cat_words)}"
-                prompt = f"""당신은 사용자 맞춤형 영어 단어 학습 코치입니다. 학습 기록을 바탕으로 간결하고 실행 가능한 학습 전략을 제안하세요. 300자 이내 한국어로 격려하는 어조로 답하고, 오늘 집중할 단어 5개와 각 이유를 한 줄씩 알려주세요.
-
-- 자주 틀리는 단어(최근 오답): {wrong_words}
-- 최근 5개 시험 점수: {recent_scores}
-- 카테고리별 암기 진도: {category_progress}"""
-                try:
-                    st.session_state.coach_tip = gemini_text(prompt)
-                except Exception:
-                    st.warning("AI 응답을 가져오지 못했습니다. 잠시 후 다시 시도하세요.")
-            if st.session_state.coach_tip:
-                st.write(st.session_state.coach_tip)
+            st.markdown("#### 🌟 오늘의 학습 추천 (AI 코치 · 하루 1회)")
+            today_key = utcnow().astimezone(app_tz()).date().isoformat()
+            wrong_words = [w["word"] for w in words if w["no"] in st.session_state.wrong][:30]
+            coach_stats = {
+                "recent_wrong_words": wrong_words,
+                "recent_test_scores": [s.get("score", 0) for s in st.session_state.sessions[-5:]],
+                "category_progress": {
+                    cat: f"{len([w for w in words if w['category'] == cat and w['no'] in (st.session_state.memorized | st.session_state.correct_words)])}"
+                         f"/{len([w for w in words if w['category'] == cat])}"
+                    for cat in all_categories},
+            }
+            c_get, c_new = st.columns(2)
+            want = c_get.button("오늘의 추천 받기", key="get_coach", width="stretch")
+            fresh = c_new.button("🔄 다시 추천받기", key="refresh_coach", width="stretch")
+            try:
+                tip = ai.coach(coach_stats, today_key, cached_only=not (want or fresh), fresh=fresh)
+            except AIError as exc:
+                tip = None
+                st.warning(exc.user_message)
+            if tip:
+                st.write(tip.summary)
+                for f in tip.focus:
+                    st.caption(f"• **{f.word}** — {f.reason}")
+            else:
+                st.caption("버튼을 누르면 오늘의 추천을 만듭니다(하루 1회 생성 후 저장해 재사용).")
 
     sc1, sc2, sc3, sc4, sc5 = st.columns(5)
     sc1.metric("전체",        f"{total}개")
@@ -1800,3 +1538,6 @@ with tab_stats:
             st.session_state.correct_words = set()
             st.session_state.sessions      = []
             save_progress(); st.rerun()
+
+
+_sync_browser_progress()

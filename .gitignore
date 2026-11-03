@@ -8,3 +8,16 @@ android_app/
 start_server.bat
 start_server.ps1
 .claude/
+
+# WordLoop AI v2 — 로컬 전용 데이터/비밀값
+.venv/
+.backup/
+data/
+*.db
+*.db-journal
+.env.*
+!.env.example
+.pytest_cache/
+node_modules/
+supabase/.branches/
+supabase/.temp/

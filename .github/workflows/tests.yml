@@ -1,0 +1,45 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Python 테스트 (AI·DB 없이)
+        run: pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: 필기 컴포넌트 로직 테스트
+        run: node --test tests/js/handwriting.test.mjs
+
+  supabase:
+    # 로컬 Supabase(Auth+PostgREST+Postgres)를 띄워 RLS·RPC·마이그레이션·두 기기 동기화를 실제로 검증
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.120.0
+      - run: supabase start
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Supabase 통합 테스트
+        run: |
+          export WORDLOOP_TEST_SUPABASE_URL=http://127.0.0.1:55321
+          export WORDLOOP_TEST_SUPABASE_ANON_KEY=$(supabase status -o env | grep '^ANON_KEY=' | cut -d= -f2- | tr -d '"')
+          pytest -q tests/test_auth_rls.py tests/test_review_idempotency.py tests/test_migration.py tests/test_legacy_app_smoke.py
